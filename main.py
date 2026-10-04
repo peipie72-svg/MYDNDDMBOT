@@ -9,17 +9,29 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
     * sqlite3 (stdlib) — постоянное хранение сессий в файле bot_database.db
 
 Команды:
-    /start     — приветствие, сброс прошлой сессии и старт нового приключения
+    /start     — приветствие, сброс прошлой сессии и создание героя
     /reset     — принудительный сброс контекста, игра начинается с чистого листа
+    /hero      — сгенерировать случайного героя 1-го уровня по правилам PHB 2024
     /roll      — бросок кубиков, считаемый кодом (например: /roll d20, /roll 2d6+3)
     /sheet     — показать лист персонажа (имя, класс, HP, характеристики, снаряжение)
     /inventory — список снаряжения и золота
     /check     — меню проверок характеристик (СИЛ/ЛОВ/ТЕЛ/ИНТ/МУД/ХАР)
 
+ЭТАП 1 — создание персонажа:
+    Новая игра начинается не с пролога, а с создания героя. В первом ответе Мастер
+    приветствует игрока и просит имя, вид (расу), класс и краткое описание героя
+    (либо «Случайный герой»). Пока герой не подтверждён, Мастер не описывает мир и
+    не начинает сюжет. Характеристики, максимум HP и стартовое снаряжение 1-го уровня
+    выставляет КОД бота (см. build_random_hero и apply_starter_loadout),
+    а не нейросеть; Мастер лишь вносит имя, вид, класс и описание в служебном блоке.
+    После подтверждения героя (сообщение «да» или кнопка «✅ Подтвердить героя»)
+    начинается вводная сцена пролога.
+
 Инлайн-кнопки (под каждым ответом Мастера):
     🎲 d20 / 🎲 d20 с преим. / 🎲 d20 с помех. — мгновенный бросок кодом
     📜 Лист / 🎒 Инвентарь / 🎲 Бросок урона    — лист, снаряжение, урон оружием
     🧠 Проверки по статам                      — меню проверок d20 + модификатор
+    🎲 Случайный герой / ✅ Подтвердить героя    — кнопки этапа создания персонажа
     Любое нажатие пишется в историю и SQLite так же, как обычная команда игрока.
 
 Любое другое текстовое сообщение воспринимается как действие игрока
@@ -70,16 +82,26 @@ from dnd2024_reference import (
     ABILITIES,
     ABILITY_FULL_RU,
     ABILITY_GENITIVE_RU,
+    ARMOR,
+    CLASSES,
     MAX_LEVEL,
+    SHIELD_BONUS,
+    SPECIES,
     WEAPONS,
     ability_modifier,
+    ability_priority_for_class,
     average_hit_points,
     build_reference_digest,
+    class_name_from_text,
     format_modifier,
     hit_die_sides,
     next_xp_threshold,
     normalize_ability_key,
     proficiency_bonus,
+    species_name,
+    standard_array_for_class,
+    starter_equipment_for_class,
+    starting_gold_for_class,
 )
 
 # ---------------------------------------------------------------------------
@@ -165,6 +187,32 @@ BASE_DM_PROMPT = """
 8. Ты ведёшь лист персонажа игрока и отражаешь в нём все изменения (опыт, урон и лечение,
    добытые и потерянные предметы, золото) через служебный блок, описанный в конце промпта.
 
+# ЭТАП 1 — СОЗДАНИЕ ПЕРСОНАЖА (ВАЖНЕЕ ВСЕГО ОСТАЛЬНОГО)
+- Если служебное сообщение [СИСТЕМА] сообщает, что идёт создание персонажа, то сначала создаётся
+  герой. В этой фазе КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО начинать приключение: не описывай мир, места,
+  события и NPC, не давай сюжетных зацепок, не начинай пролог — даже если игрок торопит.
+- Первое сообщение новой игры: атмосферно поприветствуй игрока как Мастер Подземелий (1–3 абзаца)
+  и попроси его определиться с героем:
+    * имя персонажа;
+    * вид (раса) — только из 10 официальных видов PHB 2024: Человек, Эльф, Дварф, Гном,
+      Полурослик, Драконорождённый, Тифлинг, Орк, Голиаф, Аасимар;
+    * класс — только из 12 официальных классов PHB 2024: Воин, Варвар, Плут, Волшебник, Жрец,
+      Следопыт, Паладин, Бард, Друид, Колдун, Монах, Чародей;
+    * краткое описание внешности или характера.
+  Предложи игроку либо придумать всё самому, либо написать «Случайный герой» (или нажать кнопку
+  «🎲 Случайный герой») — тогда готового героя 1-го уровня сгенерирует система по правилам
+  PHB 2024. Заканчивай реплику вопросом о герое, а не вопросом «Что ты делаешь?».
+- Как только игрок назвал данные героя (например, «Меня зовут Боб, я человек воин»), в КОНЦЕ
+  этого же ответа добавь служебный JSON-блок с полями "name", "race", "class_name" и, если игрок
+  описал внешность или характер, "description".
+- Характеристики, максимум и текущие HP, снаряжение и золото НЕ выдумывай и в блок не пиши:
+  их по правилам PHB 2024 выставит система (стандартный набор характеристик по классу,
+  максимум HP = кость хитов + ТЕЛ, стартовый набор снаряжения 1-го уровня).
+- Затем попроси игрока подтвердить героя («Всё верно: Боб, человек-воин?») и жди ответа.
+  Просит что-то изменить — исправь поля в служебном блоке и снова попроси подтверждения.
+- Только когда система сообщит [СИСТЕМА], что игрок подтвердил героя, начинай вводную сцену
+  пролога («Боб, твоя история начинается…») и дальше ведёшь обычное приключение.
+
 # БРОСКИ КУБИКОВ
 - В неопределённых, рискованных или опасных ситуациях требуй бросок d20 с модификатором:
   проверку характеристики, спасбросок или бросок атаки.
@@ -180,6 +228,7 @@ BASE_DM_PROMPT = """
 
 # ЗАВЕРШЕНИЕ ХОДА
 - Каждую свою реплику обязательно заканчивай прямым вопросом игроку: «Что ты делаешь?»
+  В фазе создания персонажа вместо этого задай вопрос о герое (имя, вид, класс, подтверждение).
 """.strip()
 
 # Инструкция о скрытом служебном блоке изменений листа персонажа.
@@ -208,9 +257,14 @@ CONTROL_BLOCK_INSTRUCTIONS = """
 - "gp_change" — целое число: изменение количества золота.
 
 Дополнительно, ТОЛЬКО при создании персонажа (когда игрок описывает своего героя), в этом же
-блоке можно указать поля: "name", "race", "class_name" (строки); "abilities" (объект вида
-{"str": 15, "dex": 14, "con": 13, "int": 12, "wis": 10, "cha": 8}); "level"; "max_hp";
-"current_hp"; "heroic_inspiration" (true/false).
+блоке укажи строковые поля: "name" (имя), "race" (вид/раса) и "class_name" (класс), а также
+"description" — краткое описание внешности или характера, если игрок его дал.
+
+Характеристики ("abilities"), "level", "max_hp", "current_hp", снаряжение и золото при создании
+героя НЕ указывай: их по правилам PHB 2024 выставит система. Эти поля (объект "abilities" вида
+{"str": 15, "dex": 14, "con": 13, "int": 12, "wis": 10, "cha": 8}; "level"; "max_hp";
+"current_hp"; "heroic_inspiration" (true/false)) используй только для последующих изменений
+листа по ходу игры.
 
 Правила блока (строго):
 - Блок не виден игроку: НЕ упоминай его и не пересказывай в тексте ответа.
@@ -229,26 +283,122 @@ WELCOME_TEXT = (
     "🐉 Добро пожаловать за стол, искатель приключений!\n\n"
     "Я — твой Мастер Подземелий в духе Dungeons & Dragons 5e (2024). Я опишу мир, его "
     "опасности и судьбу твоего героя, но все решения остаются за тобой.\n\n"
+    "Шаг 1 — создай героя:\n"
+    "• Назови имя, вид (раса), класс и пару слов о внешности или характере героя.\n"
+    "• Виды по правилам PHB 2024: Человек, Эльф, Дварф, Гном, Полурослик, Драконорождённый, "
+    "Тифлинг, Орк, Голиаф, Аасимар.\n"
+    "• Классы: Воин, Варвар, Плут, Волшебник, Жрец, Следопыт, Паладин, Бард, Друид, Колдун, "
+    "Монах, Чародей.\n"
+    "• Не хочешь придумывать сам — напиши «Случайный герой» или нажми кнопку "
+    "«🎲 Случайный герой»: я соберу героя 1-го уровня строго по правилам PHB 2024 "
+    "(характеристики, HP и стартовое снаряжение считает код бота).\n"
+    "• Затем подтверди героя («да» или кнопка «✅ Подтвердить героя») — и начнётся пролог.\n\n"
     "Как играть:\n"
     "• Пиши обычными сообщениями, что делает и говорит твой персонаж.\n"
     "• Когда исход поступка неочевиден или опасен, я попрошу бросок кубика.\n"
     "• Броски делает только код бота: жми кнопки 🎲 d20, 🎲 d20 с преим./помех., 🎲 Бросок урона "
     "или используй команду /roll, например /roll d20 или /roll 2d6+3.\n"
     "• Проверки характеристик с модификатором — кнопка 🧠 Проверки по статам или команда /check.\n"
-    "• Играй по правилам Книги Игрока 2024 — я не приму накрученные броски и урон не по правилам.\n\n"
+    "• Играй по правилам Книги Игрока 2024 — я не приму накрученные броски и урон не по правилам.\n"
     "• Веди лист персонажа: кнопки «📜 Лист» и «🎒 Инвентарь», команды /sheet и /inventory.\n"
-    "Команды: /start, /reset, /roll <кубик>, /sheet, /inventory, /check.\n\n"
-    "Предыдущая сессия сброшена. Новая история начинается прямо сейчас…"
+    "Команды: /start, /reset, /hero, /roll <кубик>, /sheet, /inventory, /check.\n\n"
+    "Предыдущая сессия сброшена. Сперва — герой, потом — приключение!"
 )
 
-NEW_ADVENTURE_PROMPT = (
-    "[СИСТЕМА] Начни новое приключение с нуля. Придумай название мира и короткую завязку "
-    "в духе тёмного героического фэнтези. Опиши стартовую сцену в 2–6 абзацах, дай одну-две "
-    "зацепки и остановись в точке выбора. НЕ описывай действия, слова и мысли персонажа игрока — "
-    "их определяет только игрок. Лист персонажа пока пуст: предложи игроку назвать имя, расу "
-    "и класс героя (класс — только из официальных классов D&D 2024). Как только игрок опишет "
-    "героя, заполни его лист через служебный блок. Закончи прямым вопросом «Что ты делаешь?»"
+# ---------------------------------------------------------------------------
+# ЭТАП 1: ТЕКСТЫ СОЗДАНИЯ ПЕРСОНАЖА
+# ---------------------------------------------------------------------------
+
+# Фазы общения с игроком (см. creation_stage).
+CREATION_STAGE_HERO = "creation"          # герой ещё не описан
+CREATION_STAGE_CONFIRM = "confirmation"   # герой описан, ждём подтверждения игрока
+CREATION_STAGE_PLAY = "play"              # герой подтверждён, идёт приключение
+
+# Инструкция Мастеру для самого первого сообщения новой игры: только приветствие и герой.
+HERO_CREATION_START_PROMPT = (
+    "[СИСТЕМА] Новая игра. История диалога пуста, лист персонажа пуст: имя, вид (раса) и класс "
+    "ещё не заданы. Идёт ЭТАП 1 — создание персонажа, приключение ещё НЕ началось.\n"
+    "Задание: атмосферно поприветствуй игрока как Мастер Подземелий (1–3 абзаца) и попроси его "
+    "определиться с героем: имя; вид (раса) — только из 10 официальных видов PHB 2024 (Человек, "
+    "Эльф, Дварф, Гном, Полурослик, Драконорождённый, Тифлинг, Орк, Голиаф, Аасимар); класс — "
+    "только из 12 официальных классов PHB 2024 (Воин, Варвар, Плут, Волшебник, Жрец, Следопыт, "
+    "Паладин, Бард, Друид, Колдун, Монах, Чародей); краткое описание внешности или характера.\n"
+    "Предложи игроку либо придумать героя самому, либо написать «Случайный герой» / нажать кнопку "
+    "«🎲 Случайный герой» — тогда героя сгенерирует система по правилам PHB 2024.\n"
+    "НЕ описывай мир, сцену, события и зацепки, не начинай пролог — только создание героя. "
+    "Закончи реплику вопросом о герое (не «Что ты делаешь?»)."
 )
+
+# Инструкция Мастеру для продолжения фазы создания (герой всё ещё не описан).
+HERO_CREATION_PROMPT = (
+    "[СИСТЕМА] Продолжается ЭТАП 1 — создание персонажа: в листе всё ещё нет имени, вида или "
+    "класса. Приключение НЕ началось: не описывай мир, сцену, события и зацепки, не начинай "
+    "пролог, даже если игрок просит начать игру.\n"
+    "Задание: ответь игроку по существу и помоги завершить героя. Как только он назовёт данные "
+    "героя, добавь в КОНЕЦ ответа служебный JSON-блок с полями \"name\", \"race\", \"class_name\" "
+    "и (если игрок описал внешность или характер) \"description\". Характеристики, HP, снаряжение "
+    "и золото не выдумывай — их выставит система по правилам PHB 2024. Затем попроси игрока "
+    "подтвердить героя."
+)
+
+# Тексты, которые бот показывает игроку после создания героя.
+HERO_CARD_TITLE_CREATED = "✅ Герой записан в лист персонажа!"
+HERO_CARD_TITLE_RANDOM = "🎲 Случайный герой готов!"
+HERO_CARD_TITLE_PENDING = "📜 Герой ещё не подтверждён — проверь его перед началом игры"
+
+HERO_CARD_QUESTION = (
+    "Всё верно? Напиши «да» или нажми «✅ Подтвердить героя» — и начнётся пролог.\n"
+    "Хочешь что-то поменять (имя, вид, класс, внешность) — просто напиши, что изменить."
+)
+
+HERO_NOT_CREATED_ALERT = (
+    "Сначала закончим героя: нужны имя, вид (раса) и класс.\n"
+    "Опиши их в сообщении или нажми «🎲 Случайный герой»."
+)
+
+HERO_ALREADY_CONFIRMED_ALERT = "Герой уже подтверждён — приключение идёт. Что ты делаешь?"
+
+HERO_ALREADY_CONFIRMED_TEXT = (
+    "✅ Герой уже подтверждён, приключение идёт полным ходом.\n\nЧто ты делаешь?"
+)
+
+# Признаки того, что игрок просит сгенерировать героя вместо описания своего.
+RANDOM_HERO_MARKERS: tuple[str, ...] = (
+    "случайн", "наугад", "рандом", "random", "любой герой", "выбери за меня",
+    "сгенерируй геро", "сгенерируй персон", "придумай за меня", "составь за меня",
+)
+
+# Согласие игрока подтвердить героя: короткое сообщение вида «да», «подтверждаю», «начинаем».
+HERO_CONFIRM_PATTERN = re.compile(
+    r"^\s*(?:я\s+)?(?:да|ага|угу|верно|всё верно|все верно|всё правильно|все правильно|"
+    r"подтверждаю(?:\s+героя)?|согласен|согласна|ок|окей|окэй|хорошо|принято|готов|готова|"
+    r"начинаем|начинай|поехали|играем|давай|yes|yep|ok|go)\s*,?\s*"
+    r"(?:начинаем|начинай|поехали|играем|играть|давай|в путь|герой|героем|этим героем)?"
+    r"\s*[!.,…]*\s*$",
+    re.IGNORECASE,
+)
+
+# Имя героя из явного представления: «Меня зовут Боб», «зови меня Грим».
+HERO_NAME_PATTERN = re.compile(
+    r"(?:меня зовут|моё имя|мое имя|зови меня|зовут меня)\s+"
+    r"(?P<name>[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё'\-]{1,31})",
+    re.IGNORECASE,
+)
+
+# Имена и заготовки характера для случайного героя: (имя, описание внешности/характера).
+RANDOM_HERO_PROFILES: tuple[tuple[str, str], ...] = (
+    ("Каэлен", "Сухощавый, с обветренным лицом и внимательным взглядом; молчалив, но упрям."),
+    ("Брунхильда", "Крепкая, с косой цвета соломы; смеётся громко, а в драке не отступает."),
+    ("Тэм", "Невысокий ловкач с быстрыми глазами и вечной ухмылкой; ценит тишину и монету."),
+    ("Селена", "Стройная, с серебристой прядью в волосах; говорит спокойно и смотрит прямо."),
+    ("Грим", "Широкоплечий бородач со шрамами на руках; грубоват, но верен слову."),
+    ("Нисса", "Хрупкая на вид, с цепкими пальцами и живым умом; любопытна до неприличия."),
+    ("Ортега", "Загорелый, с кольцами в бороде; в пути поёт, чтобы не думать о прошлом."),
+    ("Виллемина", "Молодая, с медной кожей и упрямым подбородком; верит, что удача — это умение."),
+    ("Драган", "Высокий, с тяжёлым взглядом и спокойными движениями; сперва думает, потом бьёт."),
+    ("Лиора", "Светловолосая, в дорожном плаще; собирает чужие истории, свою пока не рассказала."),
+)
+
 
 ROLL_USAGE_TEXT = (
     "Формат броска: /roll <кубик>\n"
@@ -521,6 +671,10 @@ class Character:
     abilities: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_ABILITIES))
     inventory: list[str] = field(default_factory=list)
     heroic_inspiration: bool = False
+    description: str = ""
+    # Признак «игрок подтвердил героя». Пока он False, идёт этап создания персонажа
+    # (см. creation_stage) и приключение с прологом не начинается.
+    hero_confirmed: bool = False
 
     def __post_init__(self) -> None:
         """Нормализует «сырые» данные: обрезает строки и приводит числа к правилам."""
@@ -546,6 +700,18 @@ class Character:
         else:
             self.current_hp = max(0, min(_as_int(self.current_hp), self.max_hp))
         self.inventory = _as_text_list(self.inventory)
+        self.description = (self.description or "").strip()[:400]
+
+    # --- Проверки состояния персонажа ---
+
+    @property
+    def is_created(self) -> bool:
+        """True, если игрок уже описал героя: заданы имя, вид (раса) и класс."""
+        return (
+            self.name != DEFAULT_NAME
+            and self.race != DEFAULT_RACE
+            and self.class_name != DEFAULT_CLASS
+        )
 
     # --- Производные характеристики (считаются по правилам) ---
 
@@ -570,8 +736,50 @@ class Character:
 
     @property
     def armor_class(self) -> int:
-        """КД без доспехов: 10 + модификатор ЛОВ."""
-        return 10 + self.ability_mod("dex")
+        """КД по правилам PHB 2024: доспех из снаряжения + модификатор ЛОВ (+2 за щит)."""
+        armor = self.best_armor
+        dex_mod = self.ability_mod("dex")
+
+        if armor is None:
+            armor_class = 10 + dex_mod
+        else:
+            _name, base_ac, max_dex = armor
+            if max_dex == 0:            # тяжёлый доспех — модификатор ЛОВ не добавляется
+                armor_class = base_ac
+            elif max_dex is None:       # лёгкий доспех — модификатор ЛОВ без ограничения
+                armor_class = base_ac + dex_mod
+            else:                       # средний доспех — модификатор ЛОВ не выше предела
+                armor_class = base_ac + min(dex_mod, max_dex)
+
+        if self.has_shield:
+            armor_class += SHIELD_BONUS
+        return armor_class
+
+    @property
+    def best_armor(self) -> Optional[tuple[str, int, Optional[int]]]:
+        """Лучший доспех из снаряжения: (название, база КД, предел модификатора ЛОВ)."""
+        best: Optional[tuple[str, int, Optional[int]]] = None
+        for item in self.inventory:
+            lowered = item.strip().lower()
+            for name, _category, base_ac, max_dex, _strength, _stealth in ARMOR:
+                if name.lower() in lowered and (best is None or base_ac > best[1]):
+                    best = (name, base_ac, max_dex)
+        return best
+
+    @property
+    def has_shield(self) -> bool:
+        """Есть ли щит в снаряжении героя."""
+        return any("щит" in item.lower() for item in self.inventory)
+
+    @property
+    def armor_label(self) -> str:
+        """Подпись доспеха для листа персонажа: «Кольчуга, щит» или «без доспехов»."""
+        names: list[str] = []
+        if self.best_armor is not None:
+            names.append(self.best_armor[0])
+        if self.has_shield:
+            names.append("щит")
+        return ", ".join(names) if names else "без доспехов"
 
     @property
     def passive_perception(self) -> int:
@@ -626,6 +834,13 @@ class Character:
             if cleaned != self.class_name:
                 self.class_name = cleaned
                 notes.append(f"⚔️ Класс: {self.class_name} (кость хитов d{self.hit_die}).")
+
+        description = data.get("description")
+        if isinstance(description, str) and description.strip():
+            cleaned_description = description.strip()[:400]
+            if cleaned_description != self.description:
+                self.description = cleaned_description
+                notes.append("🖋️ Описание героя записано.")
 
         level = _as_int(data.get("level"))
         if 1 <= level <= MAX_LEVEL and level != self.level:
@@ -722,6 +937,8 @@ class Character:
             "abilities": {code: int(self.abilities[code]) for code in ABILITIES},
             "inventory": list(self.inventory),
             "heroic_inspiration": bool(self.heroic_inspiration),
+            "description": self.description,
+            "hero_confirmed": bool(self.hero_confirmed),
         }
 
     def to_json(self) -> str:
@@ -754,10 +971,24 @@ class Character:
         # Отсутствие current_hp означает «не задано» (полное здоровье), а не 0 HP.
         current_hp = UNSET_HP if data.get("current_hp") is None else _as_int(data.get("current_hp"))
 
+        name = _as_optional_text(data.get("name")) or DEFAULT_NAME
+        race = _as_optional_text(data.get("race")) or DEFAULT_RACE
+        class_name = _as_optional_text(data.get("class_name")) or DEFAULT_CLASS
+
+        # Записи базы прежних версий не знали про подтверждение героя: если герой уже
+        # был создан, считаем его подтверждённым, иначе игрок застрял бы на подтверждении.
+        raw_confirmed = data.get("hero_confirmed")
+        if isinstance(raw_confirmed, bool):
+            hero_confirmed = raw_confirmed
+        else:
+            hero_confirmed = (
+                name != DEFAULT_NAME and race != DEFAULT_RACE and class_name != DEFAULT_CLASS
+            )
+
         return cls(
-            name=_as_optional_text(data.get("name")) or DEFAULT_NAME,
-            race=_as_optional_text(data.get("race")) or DEFAULT_RACE,
-            class_name=_as_optional_text(data.get("class_name")) or DEFAULT_CLASS,
+            name=name,
+            race=race,
+            class_name=class_name,
             level=_as_int(data.get("level")) or 1,
             current_hp=current_hp,
             max_hp=_as_int(data.get("max_hp")),
@@ -766,6 +997,8 @@ class Character:
             abilities=abilities or dict(DEFAULT_ABILITIES),
             inventory=_as_text_list(data.get("inventory")),
             heroic_inspiration=inspiration if isinstance(inspiration, bool) else False,
+            description=_as_optional_text(data.get("description")) or "",
+            hero_confirmed=hero_confirmed,
         )
 
     @classmethod
@@ -821,6 +1054,11 @@ def format_character_sheet(character: Character) -> str:
     status = "жив" if character.is_alive else "без сознания"
     inspiration = "да" if character.heroic_inspiration else "нет"
 
+    # Описание внешности и характера показываем, только если игрок его задал.
+    description_lines = (
+        [f"🖋️ Описание: {character.description}"] if character.description else []
+    )
+
     return "\n".join(
         [
             "📜 ЛИСТ ПЕРСОНАЖА",
@@ -828,10 +1066,11 @@ def format_character_sheet(character: Character) -> str:
             f"📛 Имя: {character.name}",
             f"🧬 Раса: {character.race}",
             f"⚔️ Класс: {character.class_name} (кость хитов d{character.hit_die})",
+            *description_lines,
             f"🎖️ Уровень: {character.level} "
             f"(бонус мастерства {format_modifier(character.proficiency_bonus)})",
             f"🧭 Инициатива {format_modifier(character.initiative)} | "
-            f"КД без доспехов {character.armor_class} | "
+            f"КД {character.armor_class} ({character.armor_label}) | "
             f"Пассивная Внимательность {character.passive_perception}",
             "",
             f"❤️ HP [{hp_bar}] {character.current_hp}/{character.max_hp} ({status})",
@@ -869,6 +1108,240 @@ def format_inventory(character: Character) -> str:
             f"{character.current_hp}/{character.max_hp}",
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# ЭТАП 1: ЛОГИКА СОЗДАНИЯ ПЕРСОНАЖА (героя собирает код, а не нейросеть)
+# ---------------------------------------------------------------------------
+
+
+def creation_stage(character: Character) -> str:
+    """Фаза общения с игроком: создание героя, подтверждение героя или сама игра."""
+    if not character.is_created:
+        return CREATION_STAGE_HERO
+    if not character.hero_confirmed:
+        return CREATION_STAGE_CONFIRM
+    return CREATION_STAGE_PLAY
+
+
+def hero_summary(character: Character) -> str:
+    """Однострочная выжимка о герое для служебных сообщений Мастеру."""
+    if not character.is_created:
+        missing = [
+            title
+            for title, value, default in (
+                ("имя", character.name, DEFAULT_NAME),
+                ("вид (раса)", character.race, DEFAULT_RACE),
+                ("класс", character.class_name, DEFAULT_CLASS),
+            )
+            if value == default
+        ]
+        return "Лист персонажа ещё не заполнен: не заданы " + ", ".join(missing) + "."
+
+    abilities = ", ".join(
+        f"{ABILITIES[code]} {character.abilities[code]}" for code in ABILITIES
+    )
+    parts = [
+        f"имя: {character.name}",
+        f"вид (раса): {character.race}",
+        f"класс: {character.class_name}",
+        f"уровень: {character.level}",
+        f"HP: {character.current_hp}/{character.max_hp}",
+        f"характеристики: {abilities}",
+    ]
+    if character.description:
+        parts.append(f"описание: {character.description}")
+    if character.inventory:
+        parts.append("снаряжение: " + ", ".join(character.inventory))
+    return "Данные героя — " + "; ".join(parts) + "."
+
+
+def creation_prompt(session: Session) -> str:
+    """Инструкция Мастеру в фазе создания: первое сообщение игры или продолжение."""
+    if len(session.history) <= 1:
+        return HERO_CREATION_START_PROMPT
+    return HERO_CREATION_PROMPT
+
+
+def hero_confirmation_prompt(character: Character) -> str:
+    """Инструкция Мастеру: герой создан, но игрок его ещё не подтвердил."""
+    return (
+        "[СИСТЕМА] Этап создания персонажа: герой записан в лист, но игрок его ещё НЕ подтвердил. "
+        "Приключение и пролог начинать ЗАПРЕЩЕНО.\n"
+        f"{hero_summary(character)}\n"
+        "Задание: коротко (1–2 абзаца) отреагируй на сообщение игрока. Просит изменить героя — "
+        "исправь нужные поля (\"name\", \"race\", \"class_name\", \"description\") в служебном "
+        "JSON-блоке; описывает действия вместо героя — вежливо напомни, что сначала нужно "
+        "подтвердить героя. В конце спроси, всё ли верно с героем: подтвердить можно словом «да» "
+        "или кнопкой «✅ Подтвердить героя». Пролог не начинай."
+    )
+
+
+def prologue_prompt(character: Character) -> str:
+    """Инструкция Мастеру начать вводную сцену после подтверждения героя."""
+    return (
+        "[СИСТЕМА] Игрок подтвердил героя. Этап создания персонажа завершён — начинается игра.\n"
+        f"{hero_summary(character)}\n"
+        "Задание: начни вводную сцену пролога по правилам D&D 2024: атмосферно опиши, где и как "
+        f"начинается путь героя, назови его по имени («{character.name}, твоя история "
+        "начинается…»), придумай название мира и короткую завязку в духе тёмного героического "
+        "фэнтези, дай одну-две зацепки и остановись в точке выбора. НЕ описывай действия, слова и "
+        "мысли героя игрока. Закончи вопросом «Что ты делаешь?»"
+    )
+
+
+def random_hero_prompt(character: Character) -> str:
+    """Инструкция Мастеру представить уже сгенерированного кодом случайного героя."""
+    return (
+        "[СИСТЕМА] Игрок выбрал случайного героя: система уже сгенерировала его строго по "
+        "правилам PHB 2024 (характеристики, HP, стартовое снаряжение и золото) и записала в лист "
+        "персонажа.\n"
+        f"{hero_summary(character)}\n"
+        "Задание: представь игроку этого героя (1–2 абзаца) — имя, вид, класс, внешность и "
+        "характер. Приключение НЕ начинай и пролог не описывай: попроси игрока подтвердить героя "
+        "(«да» или кнопка «✅ Подтвердить героя»)."
+    )
+
+
+def is_random_hero_request(text: str) -> bool:
+    """Просит ли игрок сгенерировать героя вместо того, чтобы описывать своего."""
+    lowered = text.strip().lower()
+    if lowered.startswith(("/hero", "/randomhero")):
+        return True
+    return any(marker in lowered for marker in RANDOM_HERO_MARKERS)
+
+
+def is_hero_confirmation(text: str) -> bool:
+    """Короткое согласие игрока с созданным героем («да», «подтверждаю», «начинаем»)."""
+    if len(text) > 40:
+        return False
+    return bool(HERO_CONFIRM_PATTERN.match(text.strip()))
+
+
+def detect_hero_details(text: str) -> dict[str, str]:
+    """Достаёт из сообщения игрока имя, вид и класс героя (страховка для служебного блока).
+
+    Возвращает словарь с ключами "name"/"race"/"class_name" — только то, что нашлось.
+    """
+    details: dict[str, str] = {}
+
+    name_match = HERO_NAME_PATTERN.search(text)
+    if name_match is not None:
+        raw_name = name_match.group("name").strip()
+        details["name"] = raw_name[:1].upper() + raw_name[1:]
+
+    species = species_name(text)
+    if species is not None:
+        details["race"] = species
+
+    class_name = class_name_from_text(text)
+    if class_name is not None:
+        details["class_name"] = class_name
+
+    return details
+
+
+def auto_fill_hero_details(character: Character, text: str) -> list[str]:
+    """Страховка на случай, если Мастер забудет служебный блок.
+
+    Дополняются ТОЛЬКО пустые поля листа, причём вид и класс — лишь когда игрок назвал
+    оба (случайное упоминание «мага» в рассказе не должно сделать героя волшебником).
+    """
+    if character.is_created:
+        return []
+
+    details = detect_hero_details(text)
+    notes: list[str] = []
+
+    if "name" in details and character.name == DEFAULT_NAME:
+        character.name = details["name"][:64]
+        notes.append(f"📛 Имя персонажа: {character.name}.")
+
+    if "race" in details and "class_name" in details:
+        if character.race == DEFAULT_RACE:
+            character.race = details["race"][:64]
+            notes.append(f"🧬 Раса: {character.race}.")
+        if character.class_name == DEFAULT_CLASS:
+            character.class_name = details["class_name"][:64]
+            notes.append(f"⚔️ Класс: {character.class_name} (кость хитов d{character.hit_die}).")
+
+    return notes
+
+
+def _roll_ability_score() -> int:
+    """Характеристика методом «4d6 без наименьшего кубика» (официальный метод PHB 2024)."""
+    dice = sorted((_rng.randint(1, 6) for _ in range(4)), reverse=True)
+    return sum(dice[:3])
+
+
+def build_random_hero() -> Character:
+    """Собирает случайного героя 1-го уровня строго по правилам PHB 2024 — без участия модели.
+
+    Имя и описание берутся из заготовок, вид и класс — из официальных списков, характеристики
+    бросаются методом 4d6 без наименьшего кубика и раскладываются по приоритету класса,
+    снаряжение и золото — стартовый набор класса 1-го уровня.
+    """
+    name, description = _rng.choice(RANDOM_HERO_PROFILES)
+    species = _rng.choice(tuple(SPECIES.values()))["name"]
+    class_key = _rng.choice(tuple(CLASSES))
+    class_name = CLASSES[class_key]["name"]
+
+    scores = sorted((_roll_ability_score() for _ in ABILITIES), reverse=True)
+    abilities = dict(zip(ability_priority_for_class(class_name), scores))
+
+    return Character(
+        name=name,
+        race=species,
+        class_name=class_name,
+        level=1,
+        abilities=abilities,
+        inventory=list(starter_equipment_for_class(class_name)),
+        gp=starting_gold_for_class(class_name),
+        description=description,
+        # max_hp/current_hp не задаём: __post_init__ посчитает максимум кости хитов + ТЕЛ.
+    )
+
+
+def apply_starter_loadout(character: Character, recalc_hp: bool = False) -> list[str]:
+    """Доводит только что созданного героя до правил PHB 2024 и возвращает заметки для игрока.
+
+    Применяется исключительно на этапе создания персонажа: если Мастер не передал
+    характеристики, код выставляет стандартный набор класса, а пустое снаряжение
+    заполняет стартовым набором 1-го уровня вместе со стартовым золотом.
+
+    :param recalc_hp: пересчитать максимум HP (кость хитов + модификатор ТЕЛ), когда Мастер
+        сам не задавал HP в служебном блоке.
+    """
+    notes: list[str] = []
+
+    if all(character.abilities[code] == DEFAULT_ABILITIES[code] for code in ABILITIES):
+        character.abilities = standard_array_for_class(character.class_name)
+        spread = ", ".join(
+            f"{ABILITIES[code]} {character.abilities[code]}" for code in ABILITIES
+        )
+        notes.append(f"🧠 Характеристики по стандартному набору PHB 2024: {spread}.")
+
+    if not character.inventory:
+        character.inventory = list(starter_equipment_for_class(character.class_name))
+        notes.append(
+            f"🎒 Стартовое снаряжение 1-го уровня: {', '.join(character.inventory)}."
+        )
+        if character.gp == 0:
+            character.gp = starting_gold_for_class(character.class_name)
+            notes.append(f"💰 Стартовое золото: {character.gp} gp.")
+
+    if recalc_hp:
+        # Максимум HP 1-го уровня = максимум кости хитов + модификатор ТЕЛ.
+        new_max_hp = max(1, character.hit_die + character.ability_mod("con"))
+        if new_max_hp != character.max_hp:
+            character.max_hp = new_max_hp
+            character.current_hp = new_max_hp
+            notes.append(
+                f"❤️ Здоровье 1-го уровня: d{character.hit_die} + модификатор ТЕЛ = "
+                f"{character.max_hp} HP."
+            )
+
+    return notes
 
 
 # Как оружие наносит урон: дальнобойное (ЛОВ), фехтовальное (лучшая из СИЛ/ЛОВ)
@@ -955,7 +1428,7 @@ def roll_weapon_damage(character: Character) -> tuple[DiceRoll, str]:
 CONTROL_BLOCK_KEYS = frozenset(
     {
         "xp_gained", "hp_change", "add_items", "remove_items", "gp_change",
-        "name", "race", "class_name", "level", "abilities",
+        "name", "race", "class_name", "level", "abilities", "description",
         "max_hp", "current_hp", "heroic_inspiration",
     }
 )
@@ -1092,6 +1565,25 @@ def build_checks_keyboard(character: Character) -> InlineKeyboardMarkup:
     rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton(text="⬅️ Быстрые действия", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Кнопки этапа создания персонажа: пока герой не подтверждён, показываем именно их.
+CREATION_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎲 Случайный герой", callback_data="hero:random"),
+            InlineKeyboardButton(text="✅ Подтвердить героя", callback_data="hero:confirm"),
+        ],
+        [
+            InlineKeyboardButton(text="📜 Лист", callback_data="sheet"),
+        ],
+    ]
+)
+
+
+def phase_keyboard(character: Character) -> InlineKeyboardMarkup:
+    """Клавиатура по фазе игры: создание героя или обычные игровые кнопки."""
+    return ACTION_KEYBOARD if character.hero_confirmed else CREATION_KEYBOARD
 
 
 # ---------------------------------------------------------------------------
@@ -1404,10 +1896,17 @@ async def send_long_message(
 router = Router()
 
 
-async def _answer_with_dungeon_master(message: Message, session: Session) -> None:
+async def _answer_with_dungeon_master(
+    message: Message,
+    session: Session,
+    hero_card_title: Optional[str] = None,
+) -> None:
     """Запрашивает ответ Мастера, обновляет лист персонажа и отправляет ответ игроку.
 
     Все изменения (сообщения и лист персонажа) сразу попадают в SQLite.
+
+    :param hero_card_title: заголовок карточки героя, пока он не подтверждён (например,
+        «🎲 Случайный герой готов!»). По умолчанию подбирается по ситуации.
     """
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
@@ -1425,10 +1924,25 @@ async def _answer_with_dungeon_master(message: Message, session: Session) -> Non
     # 1) Отделяем служебный блок изменений от текста и применяем его к листу персонажа.
     reply, control = extract_control_block(raw_reply)
     notes = session.character.apply_control(control) if control else []
+
+    starter_notes: list[str] = []
+    if session.character.is_created and not session.character.hero_confirmed:
+        # Герой описан, но ещё не подтверждён: доводим лист до правил PHB 2024
+        # (характеристики, максимум HP и стартовый набор снаряжения 1-го уровня).
+        # Идемпотентно: уже заполненные значения код не трогает.
+        hp_explicit = bool(
+            control
+            and (control.get("max_hp") is not None or control.get("current_hp") is not None)
+        )
+        starter_notes = apply_starter_loadout(session.character, recalc_hp=not hp_explicit)
+        notes.extend(starter_notes)
+
     if control is not None:
         logger.info("Служебный блок Мастера применён: %s", control)
+    if control is not None or starter_notes:
         # Сразу фиксируем изменения листа в SQLite, чтобы прогресс не потерялся.
         session.save_character()
+
     if not reply:
         # Модель вернула только служебный блок — не оставляем игрока без реплики.
         reply = "Мастер молчаливо следит за происходящим.\n\nЧто ты делаешь?"
@@ -1436,13 +1950,23 @@ async def _answer_with_dungeon_master(message: Message, session: Session) -> Non
     # 2) В память диалога кладём ТОЛЬКО чистый текст (без служебного JSON).
     session.add("assistant", reply)
 
-    # 3) Отправляем ответ Мастера с сеткой кнопок быстрых действий…
-    await send_long_message(message, reply, reply_markup=ACTION_KEYBOARD)
+    # 3) Отправляем ответ Мастера с кнопками текущей фазы (создание героя или игра).
+    await send_long_message(message, reply, reply_markup=phase_keyboard(session.character))
 
     # 4) …и сообщаем игроку об изменениях листа персонажа.
     if notes:
         body = "\n".join(f"• {note}" for note in notes)
         await message.answer(f"📈 Обновление листа персонажа:\n{body}")
+
+    # 5) Пока герой не подтверждён, показываем лист и ждём подтверждения —
+    #    приключение после этого шага начинают только по воле игрока.
+    if session.character.is_created and not session.character.hero_confirmed:
+        if hero_card_title is not None:
+            await _send_hero_card(message, session, hero_card_title)
+        elif starter_notes:
+            await _send_hero_card(message, session, HERO_CARD_TITLE_CREATED)
+        else:
+            await _send_hero_card(message, session)
 
 
 async def _resolve_roll(
@@ -1476,15 +2000,62 @@ def _callback_context(callback: CallbackQuery) -> Optional[tuple[Message, int]]:
     return callback.message, callback.from_user.id
 
 
-async def _start_new_adventure(message: Message, session: Session) -> None:
-    """Начинает новое приключение: отправляет Мастеру стартовый запрос."""
-    session.add("user", NEW_ADVENTURE_PROMPT)
+async def _begin_hero_creation(message: Message, session: Session) -> None:
+    """Этап 1: просит Мастера поприветствовать игрока и создать героя (приключение не начинается)."""
+    session.add("user", HERO_CREATION_START_PROMPT)
+    await _answer_with_dungeon_master(message, session)
+
+
+async def _send_hero_card(
+    message: Message,
+    session: Session,
+    title: str = HERO_CARD_TITLE_PENDING,
+) -> None:
+    """Показывает лист созданного героя и просит игрока подтвердить его."""
+    await send_long_message(
+        message,
+        f"{title}\n\n{format_character_sheet(session.character)}\n\n{HERO_CARD_QUESTION}",
+        reply_markup=CREATION_KEYBOARD,
+    )
+
+
+async def _create_random_hero(message: Message, session: Session) -> None:
+    """Генерирует случайного героя кодом по правилам PHB 2024 и просит Мастера его представить."""
+    hero = build_random_hero()
+
+    # Имя и описание, которые игрок успел назвать сам, не теряем.
+    if session.character.name != DEFAULT_NAME:
+        hero.name = session.character.name
+    if session.character.description:
+        hero.description = session.character.description
+
+    session.character = hero
+    session.save_character()
+    logger.info(
+        "Пользователь %s получил случайного героя: %s, %s %s",
+        session.user_id,
+        hero.name,
+        hero.race,
+        hero.class_name,
+    )
+
+    session.add("user", random_hero_prompt(hero))
+    await _answer_with_dungeon_master(message, session, hero_card_title=HERO_CARD_TITLE_RANDOM)
+
+
+async def _confirm_hero_and_start_prologue(message: Message, session: Session) -> None:
+    """Игрок подтвердил героя: фиксируем это и начинаем вводную сцену пролога."""
+    session.character.hero_confirmed = True
+    session.save_character()
+
+    session.add("user", prologue_prompt(session.character))
+    logger.info("Пользователь %s подтвердил героя — начинается пролог", session.user_id)
     await _answer_with_dungeon_master(message, session)
 
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    """/start — приветствие, сброс прошлой сессии и старт нового приключения."""
+    """/start — приветствие, сброс прошлой сессии и создание нового героя."""
     if message.from_user is None:
         return
     user = message.from_user
@@ -1492,22 +2063,39 @@ async def handle_start(message: Message) -> None:
     session.clear()
 
     await message.answer(WELCOME_TEXT)
-    await _start_new_adventure(message, session)
-    logger.info("Пользователь %s начал новое приключение", user.id)
+    await _begin_hero_creation(message, session)
+    logger.info("Пользователь %s начал создание персонажа", user.id)
 
 
 @router.message(Command("reset"))
 async def handle_reset(message: Message) -> None:
-    """/reset — принудительный сброс контекста и начало с чистого листа."""
+    """/reset — принудительный сброс контекста и создание героя с чистого листа."""
     if message.from_user is None:
         return
     user = message.from_user
     session = get_session(user.id)
     session.clear()
 
-    await message.answer("🔄 Контекст полностью сброшен. История начинается заново…")
-    await _start_new_adventure(message, session)
+    await message.answer(
+        "🔄 Контекст полностью сброшен: прошлый герой и история удалены.\n"
+        "Создаём нового героя…"
+    )
+    await _begin_hero_creation(message, session)
     logger.info("Пользователь %s сбросил сессию", user.id)
+
+
+@router.message(Command("hero"))
+async def handle_random_hero(message: Message) -> None:
+    """/hero — сгенерировать случайного героя 1-го уровня по правилам PHB 2024."""
+    if message.from_user is None:
+        return
+    session = get_session(message.from_user.id)
+    if session.character.hero_confirmed:
+        await message.answer(HERO_ALREADY_CONFIRMED_TEXT, reply_markup=ACTION_KEYBOARD)
+        return
+
+    await _create_random_hero(message, session)
+    logger.info("Пользователь %s вызвал случайного героя командой", message.from_user.id)
 
 
 @router.message(Command("sheet"))
@@ -1519,7 +2107,7 @@ async def handle_sheet(message: Message) -> None:
     await send_long_message(
         message,
         format_character_sheet(session.character),
-        reply_markup=ACTION_KEYBOARD,
+        reply_markup=phase_keyboard(session.character),
     )
     logger.info("Пользователь %s открыл лист персонажа", message.from_user.id)
 
@@ -1530,7 +2118,10 @@ async def handle_inventory(message: Message) -> None:
     if message.from_user is None:
         return
     session = get_session(message.from_user.id)
-    await message.answer(format_inventory(session.character), reply_markup=ACTION_KEYBOARD)
+    await message.answer(
+        format_inventory(session.character),
+        reply_markup=phase_keyboard(session.character),
+    )
     logger.info("Пользователь %s открыл снаряжение", message.from_user.id)
 
 
@@ -1545,6 +2136,49 @@ async def handle_check(message: Message) -> None:
         reply_markup=build_checks_keyboard(session.character),
     )
     logger.info("Пользователь %s открыл меню проверок", message.from_user.id)
+
+
+@router.callback_query(F.data == "hero:random")
+async def handle_random_hero_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка «🎲 Случайный герой»: код собирает героя по правилам PHB 2024."""
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+    # Гасим «часики» на кнопке — обязательно для любой CallbackQuery.
+    await callback.answer()
+
+    message, user_id = target
+    session = get_session(user_id)
+    if session.character.hero_confirmed:
+        await callback.answer(HERO_ALREADY_CONFIRMED_ALERT, show_alert=True)
+        return
+
+    logger.info("Пользователь %s нажал кнопку «Случайный герой»", user_id)
+    await _create_random_hero(message, session)
+
+
+@router.callback_query(F.data == "hero:confirm")
+async def handle_hero_confirm_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка «✅ Подтвердить героя»: герой принят, начинается пролог."""
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+
+    message, user_id = target
+    session = get_session(user_id)
+
+    if session.character.hero_confirmed:
+        await callback.answer(HERO_ALREADY_CONFIRMED_ALERT, show_alert=True)
+        return
+    if not session.character.is_created:
+        await callback.answer(HERO_NOT_CREATED_ALERT, show_alert=True)
+        return
+    await callback.answer()
+
+    logger.info("Пользователь %s подтвердил героя кнопкой", user_id)
+    await _confirm_hero_and_start_prologue(message, session)
 
 
 @router.callback_query(F.data == "sheet")
@@ -1562,7 +2196,7 @@ async def handle_sheet_button(callback: CallbackQuery) -> None:
     await send_long_message(
         message,
         format_character_sheet(session.character),
-        reply_markup=ACTION_KEYBOARD,
+        reply_markup=phase_keyboard(session.character),
     )
     logger.info("Пользователь %s открыл лист персонажа кнопкой", user_id)
 
@@ -1578,7 +2212,10 @@ async def handle_inventory_button(callback: CallbackQuery) -> None:
 
     message, user_id = target
     session = get_session(user_id)
-    await message.answer(format_inventory(session.character), reply_markup=ACTION_KEYBOARD)
+    await message.answer(
+        format_inventory(session.character),
+        reply_markup=phase_keyboard(session.character),
+    )
     logger.info("Пользователь %s открыл снаряжение кнопкой", user_id)
 
 
@@ -1719,7 +2356,7 @@ async def handle_roll(message: Message, command: CommandObject) -> None:
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_player_action(message: Message) -> None:
-    """Любое текстовое сообщение — действие/реплика персонажа игрока."""
+    """Любое текстовое сообщение: создание героя, его подтверждение или действие персонажа."""
     text = (message.text or "").strip()
     if not text or message.from_user is None:
         return
@@ -1731,12 +2368,60 @@ async def handle_player_action(message: Message) -> None:
     session = get_session(user.id)
     session.add("user", text)
 
+    stage = creation_stage(session.character)
+
+    # ЭТАП 1: пока герой не описан, приключение не начинается — только создание персонажа.
+    if stage == CREATION_STAGE_HERO:
+        # Страховка: если Мастер забудет служебный блок, имя, вид и класс распознает код.
+        fallback_notes = auto_fill_hero_details(session.character, text)
+        if fallback_notes:
+            session.save_character()
+            logger.info("Лист персонажа дополнен кодом: %s", fallback_notes)
+            await message.answer(
+                "📈 Обновление листа персонажа:\n"
+                + "\n".join(f"• {note}" for note in fallback_notes)
+            )
+
+        if not session.character.is_created and is_random_hero_request(text):
+            await _create_random_hero(message, session)
+            return
+
+        if session.character.is_created and is_hero_confirmation(text):
+            # Игрок сразу назвал героя и подтвердил его — пролог начинается без паузы.
+            await _confirm_hero_and_start_prologue(message, session)
+            return
+
+        session.add("user", creation_prompt(session))
+        await _answer_with_dungeon_master(message, session)
+        return
+
+    # Герой описан: ждём подтверждения игрока и только потом начинаем приключение.
+    if stage == CREATION_STAGE_CONFIRM:
+        if is_hero_confirmation(text):
+            await _confirm_hero_and_start_prologue(message, session)
+            return
+
+        session.add("user", hero_confirmation_prompt(session.character))
+        await _answer_with_dungeon_master(message, session)
+        return
+
     await _answer_with_dungeon_master(message, session)
 
 
 @router.message()
 async def handle_unsupported(message: Message) -> None:
     """Заглушка для нетекстовых сообщений (фото, стикеры и т.п.)."""
+    if message.from_user is None:
+        return
+    session = get_session(message.from_user.id)
+    if not session.character.hero_confirmed:
+        await message.answer(
+            "Я понимаю только текст и кнопки. Опиши героя словами (имя, вид, класс) "
+            "или нажми «🎲 Случайный герой», а затем «✅ Подтвердить героя».",
+            reply_markup=CREATION_KEYBOARD,
+        )
+        return
+
     await message.answer(
         "Я понимаю только текст и кнопки. Опиши своё действие словами, нажми кнопку "
         "быстрого броска (🎲 d20, 🎲 Бросок урона, 🧠 Проверки по статам) "
@@ -1750,8 +2435,9 @@ async def handle_unsupported(message: Message) -> None:
 # ---------------------------------------------------------------------------
 
 BOT_COMMANDS = [
-    BotCommand(command="start", description="Начать новое приключение"),
-    BotCommand(command="reset", description="Сбросить контекст и начать заново"),
+    BotCommand(command="start", description="Начать новую игру и создать героя"),
+    BotCommand(command="reset", description="Сбросить контекст и создать героя заново"),
+    BotCommand(command="hero", description="Случайный герой 1-го уровня по правилам PHB 2024"),
     BotCommand(command="roll", description="Бросить кубик, например d20 или 2d6+3"),
     BotCommand(command="sheet", description="Показать лист персонажа"),
     BotCommand(command="inventory", description="Показать снаряжение и золото"),
@@ -1805,4 +2491,5 @@ if __name__ == "__main__":
         # SystemExit при отсутствии ключей / корректная остановка по Ctrl+C.
         if str(exc):
             print(exc)
+
 
