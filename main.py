@@ -4,7 +4,7 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
 Стек:
     * Python 3
     * aiogram 3.x      — асинхронный фреймворк для Telegram Bot API
-    * openai (SDK)       — обращение к Google Gemini через Cloudflare AI Gateway
+    * openai (SDK)       — обращение к официальному API DeepSeek (OpenAI-совместимый)
     * python-dotenv    — загрузка переменных окружения из файла .env
     * sqlite3 (stdlib) — постоянное хранение сессий в файле bot_database.db
 
@@ -120,19 +120,20 @@ load_dotenv(ENV_PATH)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Ключ LLM. Для Gemini через Cloudflare AI Gateway используем ключ Google AI Studio,
-# который читаем из переменной окружения GEMINI_API_KEY (для совместимости принимаем
-# и старое имя GROQ_API_KEY). Секреты в коде не храним: укажите ключ в файле .env
+# Ключ LLM (официальный API DeepSeek). Читаем ключ из переменной окружения
+# DEEPSEEK_API_KEY; для совместимости принимаем также старые имена GEMINI_API_KEY
+# и GROQ_API_KEY. Секреты в коде не храним: укажите ключ в файле .env
 # (локально) или в переменных окружения сервера. Проверка наличия — в main().
 LLM_API_KEY = (
-    os.getenv("GEMINI_API_KEY")
+    os.getenv("DEEPSEEK_API_KEY")
+    or os.getenv("GEMINI_API_KEY")
     or os.getenv("GROQ_API_KEY")
     or ""
 ).strip()
 
-# Google Gemini через Cloudflare AI Gateway (OpenAI-совместимый эндпоинт).
-LLM_BASE_URL = "https://gateway.ai.cloudflare.com/v1/d2265e21a5e27920d37e6ae7e74eef05/dnd_bot/google-ai-studio/v1beta/openai"
-LLM_MODEL = "gemini-3.8-flash"
+# Официальный API DeepSeek (OpenAI-совместимый эндпоинт).
+LLM_BASE_URL = "https://api.deepseek.com"
+LLM_MODEL = "deepseek-chat"
 
 MAX_HISTORY_MESSAGES = 20        # сколько последних сообщений держим в памяти и грузим из БД
 DM_MAX_TOKENS = 1200             # лимит длины ответа Мастера
@@ -2040,7 +2041,7 @@ def get_session(user_id: int) -> Session:
 
 
 # ---------------------------------------------------------------------------
-# 9. КЛИЕНТ LLM (Google Gemini через Cloudflare AI Gateway, OpenAI-совместимый эндпоинт)
+# 9. КЛИЕНТ LLM (официальный API DeepSeek, OpenAI-совместимый эндпоинт)
 # ---------------------------------------------------------------------------
 
 # Клиент создаётся один раз; реальный ключ проверяется при запуске в main().
@@ -2148,7 +2149,7 @@ async def _answer_with_dungeon_master(
     try:
         raw_reply = await ask_dungeon_master(session.messages())
     except APIError as error:
-        logger.error("Ошибка LLM / Gemini API: %s", error)
+        logger.error("Ошибка LLM / DeepSeek API: %s", error)
         await message.answer(API_ERROR_TEXT)
         return
     except Exception:  # noqa: BLE001 — на верхнем уровне бота логируем всё непредвиденное
@@ -2705,7 +2706,7 @@ async def main() -> None:
     if not LLM_API_KEY:
         raise SystemExit(
             "Не задан LLM_API_KEY.\n"
-            "Создайте файл .env на основе .env.example и укажите ключ Google Gemini API."
+            "Создайте файл .env на основе .env.example и укажите ключ DeepSeek API."
         )
 
     # parse_mode=None: ответы Мастера — «сырой» текст, чтобы разметка модели
