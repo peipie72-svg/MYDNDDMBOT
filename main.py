@@ -132,7 +132,7 @@ LLM_API_KEY = (
 
 # Google Gemini через Cloudflare AI Gateway (OpenAI-совместимый эндпоинт).
 LLM_BASE_URL = "https://gateway.ai.cloudflare.com/v1/d2265e21a5e27920d37e6ae7e74eef05/dnd_bot/google-ai-studio/v1beta/openai"
-LLM_MODEL = "gemini-2.0-flash"
+LLM_MODEL = "gemini-3.8-flash"
 
 MAX_HISTORY_MESSAGES = 20        # сколько последних сообщений держим в памяти и грузим из БД
 DM_MAX_TOKENS = 1200             # лимит длины ответа Мастера
