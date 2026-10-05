@@ -121,8 +121,8 @@ load_dotenv(ENV_PATH)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 # Ключ Gemini API. Читаем из переменной окружения GEMINI_API_KEY (допустим также
-# алиас GOOGLE_API_KEY); если переменные не заданы — используем ключ по умолчанию,
-# чтобы бот работал сразу после установки.
+# алиас GOOGLE_API_KEY). Секреты в коде не храним: укажите ключ в файле .env
+# (локально) или в переменных окружения сервера. Проверка наличия ключа — в main().
 GEMINI_API_KEY = (
     os.getenv("GEMINI_API_KEY")
     or os.getenv("GOOGLE_API_KEY")
