@@ -129,9 +129,9 @@ GEMINI_API_KEY = (
     or ""
 ).strip()
 
-# Google Gemini через OpenAI-совместимый эндпоинт.
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+# LLM через OpenRouter (OpenAI-совместимый эндпоинт). Бесплатная модель.
+GEMINI_BASE_URL = "https://openrouter.ai/api/v1"
+GEMINI_MODEL = "google/gemma-4-31b-it:free"
 
 MAX_HISTORY_MESSAGES = 20        # сколько последних сообщений держим в памяти и грузим из БД
 DM_MAX_TOKENS = 1200             # лимит длины ответа Мастера
