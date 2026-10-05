@@ -4,7 +4,7 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
 Стек:
     * Python 3
     * aiogram 3.x      — асинхронный фреймворк для Telegram Bot API
-    * openai (SDK)     — обращение к DeepSeek API по OpenAI-совместимому интерфейсу
+    * openai (SDK)     — обращение к Gemini API по OpenAI-совместимому интерфейсу Google
     * python-dotenv    — загрузка переменных окружения из файла .env
     * sqlite3 (stdlib) — постоянное хранение сессий в файле bot_database.db
 
@@ -28,7 +28,8 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
     начинается вводная сцена пролога.
 
 Инлайн-кнопки (под каждым ответом Мастера):
-    🎲 d20 / 🎲 d20 с преим. / 🎲 d20 с помех. — мгновенный бросок кодом
+    🎲 d20 / 🎲 d20 с преим. / 🎲 d20 с помех. — мгновенный бросок атаки/проверки кодом
+    🗡 1d6 / 1d8 / 1d10 / 1d12                — бросок урона указанной костью (+ мод. оружия)
     📜 Лист / 🎒 Инвентарь / 🎲 Бросок урона    — лист, снаряжение, урон оружием
     🧠 Проверки по статам                      — меню проверок d20 + модификатор
     🎲 Случайный герой / ✅ Подтвердить героя    — кнопки этапа создания персонажа
@@ -118,10 +119,19 @@ DB_PATH = BASE_DIR / "bot_database.db"
 load_dotenv(ENV_PATH)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-chat"
+# Ключ Gemini API. Читаем из переменной окружения GEMINI_API_KEY (допустим также
+# алиас GOOGLE_API_KEY); если переменные не заданы — используем ключ по умолчанию,
+# чтобы бот работал сразу после установки.
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+    or GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+).strip()
+
+# Google Gemini через OpenAI-совместимый эндпоинт.
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 MAX_HISTORY_MESSAGES = 20        # сколько последних сообщений держим в памяти и грузим из БД
 DM_MAX_TOKENS = 1200             # лимит длины ответа Мастера
@@ -156,11 +166,19 @@ BASE_DM_PROMPT = """
 в личном чате Telegram. Ты одновременно и рассказчик, и судья правил.
 
 # СТИЛЬ И ФОРМАТ ОТВЕТА
-- Пиши атмосферно, ярко и кинематографично: свет, тени, звуки, запахи, детали обстановки.
+- Ты — рассказчик старой школы и ведёшь повествование так, как это делает классический Мастер
+  Подземелий за игровым столом: уверенно, увлечённо и с уважением к воображению игрока.
+- Пиши богатым, живым литературным русским языком: точные эпитеты, ритм прозы, сочные детали
+  вместо штампов. Избегай канцелярита, роботизированных оборотов и корявых формулировок
+  («ты чувствуешь, что…», «кажется, будто…», «происходит нечто»). Каждая фраза должна звучать
+  по-человечески, естественно и выразительно.
+- Раскрывай сцену чувственно и кинематографично: свет и тени, звуки, запахи, температура,
+  текстуры, движение воздуха — пусть игрок буквально видит, слышит и ощущает обстановку.
+- Пиши от второго лица («ты видишь», «перед тобой») и обращайся к герою так, как назвал его игрок.
+- Веди действие в настоящем времени и не пересказывай механику: не упоминай броски, числа
+  и названия правил в художественной прозе.
 - Каждый твой ответ — от 2 до 6 абзацев. НИКОГДА не превышай 6 абзацев за одну реплику.
-- Пиши живым русским языком, от второго лица («ты видишь», «перед тобой»).
 - Пиши ОБЫЧНЫМ текстом без Markdown-разметки: не используй символы *, _, `, # и HTML-теги.
-- Обращайся к персонажу игрока так, как его назвал сам игрок.
 
 # ЖЕЛЕЗНЫЕ ПРАВИЛА
 1. Ты НИКОГДА не действуешь и не принимаешь решения за персонажа игрока. Ты не описываешь
@@ -220,11 +238,66 @@ BASE_DM_PROMPT = """
   «Сделай проверку Ловкости (Акробатика): /roll d20+3» или
   «Брось спасбросок Телосложения: /roll d20+2».
   Модификатор также можно применить кнопкой нужной характеристики (🧠 Проверки по статам).
-- Кубики бросает только код бота: игрок жмёт кнопки бросков (🎲 d20, с преимуществом,
-  с помехой, урон) либо вводит команду /roll — ты сам броски не выполняешь и результаты
-  не придумываешь.
+- Кубики за игрока бросает только код бота: игрок жмёт кнопки бросков (🎲 d20 с преимуществом/
+  помехой, 🗡 d6/d8/d10/d12 — кости урона, «🎲 Бросок урона» — урон снаряжённым оружием) либо
+  вводит команду /roll. Ты сам за игрока броски не выполняешь и результаты не придумываешь.
+  Единственное исключение — атаки монстров в бою: их бросок выполняешь ты (см. раздел «ФАЗА БОЯ»).
 - Когда система сообщает результат броска, опиши исход по правилам D&D 5e: успех, провал,
   частичный результат и их последствия в сцене.
+
+# ФАЗА БОЯ: БОЕВОЙ ЦИКЛ ХОДОВ (Combat Turn Loop) — ОБЯЗАТЕЛЬНО К ИСПОЛНЕНИЮ
+- Бой ведётся строгим циклом ходов. Когда игрок объявляет атаку, ты не имеешь права описать её
+  одним абзацем и оставить врага без ответа — ты обязан провести весь цикл до конца.
+- Шаг А — ПОПАДАНИЕ. Атака игрока — это бросок 1d20 + БМА (бонус мастерства) + модификатор
+  характеристики (СИЛ или ЛОВ — смотри оружие в листе персонажа). Требуй от игрока бросок кнопкой
+  🎲 d20 или командой /roll d20+N и жди результата, ничего не выдумывая.
+    * Если сумма МЕНЬШЕ КД (класса доспеха) цели — это ПРОМАХ: опиши промах и сразу переходи
+      к Шагу В (ход врага).
+- Шаг Б — УРОН. Если атака ПОПАЛА по КД цели, ты ОБЯЗАН запросить бросок урона именно тем оружием,
+  которым бьёт персонаж (возьми его из снаряжения в листе персонажа). Формулируй прямо, например:
+  «Попадание! Брось 1d8+3 колющего урона твоим длинным мечом» (кнопка нужной кости — 🗡 1d8).
+  Никогда не придумывай урон сам и не описывай последствия попадания, пока игрок не бросил урон.
+  Получив бросок урона, опиши ранение монстра в прозе — HP врага код не считает.
+- Шаг В — ОТВЕТНЫЙ ХОД МОНСТРА. Сразу после того как игрок нанёс урон ИЛИ промахнулся, наступает
+  ход противника. Ты ОБЯЗАН:
+    1) описать тактическое действие монстра: кто он, как двигается и как атакует;
+    2) совершить бросок атаки монстра (d20 + бонус атаки монстра) против КД игрока (смотри лист
+       персонажа) и озвучить результат — этот бросок выполняешь ты, а не код;
+    3) если монстр ПОПАЛ, рассчитать урон и ОБЯЗАТЕЛЬНО прикрепить в самом КОНЦЕ ответа служебный
+       блок JSON, чтобы отнять HP у игрока:
+       ```json
+       {
+         "hp_change": -X
+       }
+       ```
+       где X — полученный игроком урон (положительное число);
+    4) завершить сообщение описанием ситуации и ВЕРНУТЬ инициативу игроку вопросом «Что ты делаешь?».
+- Если монстр ПРОМАХНУЛСЯ, урон игроку не наносится и блок "hp_change" НЕ добавляй (если нет
+  других изменений листа персонажа).
+- Враги должны действовать активно и правдоподобно: у каждого свой КД, HP и одна-две атаки; не
+  позволяй игроку безнаказанно бить неподвижную мишень. Веди учёт по сцене: кто ранен, кто жив.
+
+# НИКАКОЙ ЖАЛОСТИ К ИГРОКУ (NO PLOT ARMOR)
+- Мир D&D опасен и логичен. Если игрок 1-го уровня совершает безрассудные действия (нападает на
+  элитного стража, прыгает в пропасть, дразнит архимага), противники действуют без поблажек и
+  в полную силу. Не подсуживай игроку: никакой «брони сюжета» и спасений за красивые слова.
+- Угроза соответствует своему описанию: сильный враг бьёт сильно, ловушка срабатывает, а глупость
+  имеет последствия. НО поражение всегда ведёт к продолжению истории (см. ниже), а не к концу игры.
+
+# СМЕРТЬ — ЭТО НЕ КОНЕЦ (ВОСКРЕШЕНИЕ И СПАСЕНИЕ)
+- Если здоровье игрока падает до 0 от смертельного урона, игра НЕ прекращается и диалог НЕ
+  заканчивается. Опиши поражение/смерть героя и немедленно запусти сюжетный твист воскрешения
+  или спасения — выбери один из вариантов:
+    1) Тёмный культ или некромант возвращает героя к жизни: смени расу на «Нежить» или
+       «Возрождённый» (поле "race") и восстанови часть HP через "hp_change".
+    2) Стража оглушает героя, бросает в темницу и конфискует снаряжение: передай потерянные
+       предметы списком "remove_items" и перенеси героя в новую локацию ("location").
+    3) Таинственная сущность заключает сделку на пороге смерти: опиши цену сделки и дай герою
+       новый "quest".
+- В КОНЦЕ сцены смерти ты ОБЯЗАН передать служебный JSON-блок со всеми изменениями: новая раса
+  ("race") при воскрешении некромантом, восстановление части HP ("hp_change"), а также новая
+  локация ("location") и/или новый квест ("quest"). Герой не «перезагружается» к прежнему
+  состоянию: он возвращается в игру с последствиями — долгом культу, меткой смерти, потерей добра.
 
 # ЗАВЕРШЕНИЕ ХОДА
 - Каждую свою реплику обязательно заканчивай прямым вопросом игроку: «Что ты делаешь?»
@@ -245,7 +318,9 @@ CONTROL_BLOCK_INSTRUCTIONS = """
   "hp_change": 0,
   "add_items": [],
   "remove_items": [],
-  "gp_change": 0
+  "gp_change": 0,
+  "location": "",
+  "quest": ""
 }
 ```
 
@@ -255,6 +330,12 @@ CONTROL_BLOCK_INSTRUCTIONS = """
 - "hp_change" — целое число: отрицательное при уроне, положительное при лечении.
 - "add_items" / "remove_items" — массивы строк: полученные и потерянные предметы и оружие.
 - "gp_change" — целое число: изменение количества золота.
+- "location" — строка: новая локация героя (краткая сводка «📍 Локация» перед ответом игроку).
+- "quest" — строка: новая текущая цель героя (краткая сводка «🎯 Текущая цель»).
+
+Поля "location" и "quest" (HUD-сводка локации и цели) передавай ТОЛЬКО при смене обстановки или
+цели: герой перешёл в новое место, взялся за новое задание, произошёл сюжетный поворот. Игрок
+видит эту сводку автоматически перед каждым твоим ответом — не дублируй её в тексте ответа.
 
 Дополнительно, ТОЛЬКО при создании персонажа (когда игрок описывает своего героя), в этом же
 блоке укажи строковые поля: "name" (имя), "race" (вид/раса) и "class_name" (класс), а также
@@ -428,7 +509,7 @@ DM_ROLL_INSTRUCTION = (
 )
 
 API_ERROR_TEXT = (
-    "⚠️ Мастер ненадолго отвлёкся: не удалось связаться с оракулом (ошибка DeepSeek API).\n"
+    "⚠️ Мастер ненадолго отвлёкся: не удалось связаться с оракулом (ошибка Gemini API).\n"
     "Попробуй повторить сообщение через несколько секунд."
 )
 
@@ -588,6 +669,10 @@ DEFAULT_NAME = "Безымянный герой"
 DEFAULT_RACE = "Не определена"
 DEFAULT_CLASS = "Не определён"
 
+# Краткая сводка локации (HUD): где герой и какова его цель, пока Мастер не сменил их.
+DEFAULT_LOCATION = "Неизвестно"
+DEFAULT_QUEST = "Исследовать местность"
+
 # Границы значений характеристик по правилам D&D.
 MIN_ABILITY, MAX_ABILITY = 1, 30
 
@@ -650,6 +735,17 @@ def _as_optional_text(value: Any) -> Optional[str]:
     return None
 
 
+def _as_optional_label(value: Any) -> Optional[str]:
+    """Возвращает непустую текстовую метку (локация, цель) или None.
+
+    В отличие от `_as_optional_text`, числа и прочий «мусор» меткой не считаются:
+    сводка HUD должна быть осмысленной строкой, иначе берётся значение по умолчанию.
+    """
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 @dataclass
 class Character:
     """
@@ -675,6 +771,10 @@ class Character:
     # Признак «игрок подтвердил героя». Пока он False, идёт этап создания персонажа
     # (см. creation_stage) и приключение с прологом не начинается.
     hero_confirmed: bool = False
+    # Краткая сводка локации (HUD): где герой сейчас и какова его текущая цель.
+    # Обновляется служебным JSON-блоком Мастера при смене обстановки (см. apply_control).
+    location: str = DEFAULT_LOCATION
+    quest: str = DEFAULT_QUEST
 
     def __post_init__(self) -> None:
         """Нормализует «сырые» данные: обрезает строки и приводит числа к правилам."""
@@ -701,6 +801,9 @@ class Character:
             self.current_hp = max(0, min(_as_int(self.current_hp), self.max_hp))
         self.inventory = _as_text_list(self.inventory)
         self.description = (self.description or "").strip()[:400]
+        # Сводка локации и цели всегда непустая: пустая строка означает «не задано».
+        self.location = (self.location or "").strip()[:120] or DEFAULT_LOCATION
+        self.quest = (self.quest or "").strip()[:120] or DEFAULT_QUEST
 
     # --- Проверки состояния персонажа ---
 
@@ -842,6 +945,22 @@ class Character:
                 self.description = cleaned_description
                 notes.append("🖋️ Описание героя записано.")
 
+        # Сводка локации (HUD): Мастер передаёт её при смене обстановки.
+        location = data.get("location")
+        if isinstance(location, str) and location.strip():
+            cleaned_location = location.strip()[:120]
+            if cleaned_location != self.location:
+                self.location = cleaned_location
+                notes.append(f"📍 Новая локация: {self.location}.")
+
+        # Текущая цель героя — вторая строка сводки.
+        quest = data.get("quest")
+        if isinstance(quest, str) and quest.strip():
+            cleaned_quest = quest.strip()[:120]
+            if cleaned_quest != self.quest:
+                self.quest = cleaned_quest
+                notes.append(f"🎯 Новая цель: {self.quest}.")
+
         level = _as_int(data.get("level"))
         if 1 <= level <= MAX_LEVEL and level != self.level:
             self.level = level
@@ -939,6 +1058,8 @@ class Character:
             "heroic_inspiration": bool(self.heroic_inspiration),
             "description": self.description,
             "hero_confirmed": bool(self.hero_confirmed),
+            "location": self.location,
+            "quest": self.quest,
         }
 
     def to_json(self) -> str:
@@ -999,6 +1120,8 @@ class Character:
             heroic_inspiration=inspiration if isinstance(inspiration, bool) else False,
             description=_as_optional_text(data.get("description")) or "",
             hero_confirmed=hero_confirmed,
+            location=_as_optional_label(data.get("location")) or DEFAULT_LOCATION,
+            quest=_as_optional_label(data.get("quest")) or DEFAULT_QUEST,
         )
 
     @classmethod
@@ -1026,6 +1149,14 @@ def hp_progress_bar(current_hp: int, max_hp: int, width: int = 20) -> str:
     ratio = 0.0 if max_hp <= 0 else max(0.0, min(1.0, current_hp / max_hp))
     filled = round(ratio * width)
     return "█" * filled + "░" * (width - filled)
+
+
+def format_hud(character: Character) -> str:
+    """Краткая сводка локации и цели (HUD), которая идёт перед ответами Мастера в игре."""
+    return (
+        f"📍 Локация: {character.location}\n"
+        f"🎯 Текущая цель: {character.quest}"
+    )
 
 
 def format_character_sheet(character: Character) -> str:
@@ -1062,6 +1193,8 @@ def format_character_sheet(character: Character) -> str:
     return "\n".join(
         [
             "📜 ЛИСТ ПЕРСОНАЖА",
+            "",
+            format_hud(character),
             "",
             f"📛 Имя: {character.name}",
             f"🧬 Раса: {character.race}",
@@ -1147,6 +1280,7 @@ def hero_summary(character: Character) -> str:
         f"класс: {character.class_name}",
         f"уровень: {character.level}",
         f"HP: {character.current_hp}/{character.max_hp}",
+        f"КД: {character.armor_class}",
         f"характеристики: {abilities}",
     ]
     if character.description:
@@ -1424,12 +1558,58 @@ def roll_weapon_damage(character: Character) -> tuple[DiceRoll, str]:
     return roll, f"{label}, модификатор {ABILITIES[ability_code]} {format_modifier(modifier)}"
 
 
+def weapon_ability_code(character: Character) -> str:
+    """Код характеристики, модификатор которой идёт в урон текущим оружием.
+
+    Дальнобойное оружие — ЛОВ, фехтовальное — лучшая из СИЛ/ЛОВ, остальное — СИЛ.
+    Если оружия в снаряжении нет — импровизированная атака (СИЛ).
+
+    :return: код характеристики из :data:`ABILITIES` (``str``, ``dex``, …).
+    """
+    weapon = find_inventory_weapon(character)
+    if weapon is None:
+        return "str"
+
+    _name, _dice, _type, kind = weapon
+    if kind == DAMAGE_ABILITY_RANGED:
+        return "dex"
+    if kind == DAMAGE_ABILITY_FINESSE:
+        # Фехтовальное оружие: берём лучший из модификаторов СИЛ/ЛОВ.
+        return "dex" if character.ability_mod("dex") > character.ability_mod("str") else "str"
+    return "str"
+
+
+def roll_damage_die(character: Character, sides: int) -> tuple[DiceRoll, str]:
+    """Бросает 1d<sides> как урон оружием игрока (с модификатором характеристики).
+
+    Нужен кнопкам урона 🗡 d6/d8/d10/d12: кость выбирает игрок по просьбе Мастера
+    («Брось 1d8+3 колющего урона»), а модификатор характеристики берётся из
+    текущего оружия в листе персонажа.
+
+    :param sides: число граней кости (d6, d8, d10, d12).
+    :return: (бросок, подпись оружия и характеристики для игрока и Мастера).
+    """
+    sides = max(2, min(_as_int(sides), MAX_DICE_SIDES))
+    ability_code = weapon_ability_code(character)
+    modifier = character.ability_mod(ability_code)
+    roll = make_roll(count=1, sides=sides, modifier=modifier)
+
+    weapon = find_inventory_weapon(character)
+    if weapon is None:
+        weapon_label = "без оружия (импровизированная атака)"
+    else:
+        weapon_label = f"{weapon[0]} ({weapon[1]}, {weapon[2]} урон)"
+    label = f"{weapon_label}, модификатор {ABILITIES[ability_code]} {format_modifier(modifier)}"
+    return roll, label
+
+
 # Ключи, по которым распознаётся служебный JSON-блок Мастера.
 CONTROL_BLOCK_KEYS = frozenset(
     {
         "xp_gained", "hp_change", "add_items", "remove_items", "gp_change",
         "name", "race", "class_name", "level", "abilities", "description",
         "max_hp", "current_hp", "heroic_inspiration",
+        "location", "quest",
     }
 )
 
@@ -1542,6 +1722,12 @@ ACTION_KEYBOARD = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🎲 d20 с помех.", callback_data="roll:dis"),
         ],
         [
+            InlineKeyboardButton(text="🗡 1d6", callback_data="roll:d6"),
+            InlineKeyboardButton(text="🗡 1d8", callback_data="roll:d8"),
+            InlineKeyboardButton(text="🗡 1d10", callback_data="roll:d10"),
+            InlineKeyboardButton(text="🗡 1d12", callback_data="roll:d12"),
+        ],
+        [
             InlineKeyboardButton(text="📜 Лист", callback_data="sheet"),
             InlineKeyboardButton(text="🎒 Инвентарь", callback_data="inventory"),
             InlineKeyboardButton(text="🎲 Бросок урона", callback_data="roll:damage"),
@@ -1590,11 +1776,26 @@ def phase_keyboard(character: Character) -> InlineKeyboardMarkup:
 # 7. БАЗА ДАННЫХ SQLITE (постоянное хранение листов и истории)
 # ---------------------------------------------------------------------------
 
+def _json_has_key(payload: Any, key: str) -> bool:
+    """Есть ли ключ в JSON-записи листа персонажа (терпимо к «мусору» в data)."""
+    if not isinstance(payload, str):
+        return False
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and key in data
+
+
 # Схема создаётся при первом подключении; IF NOT EXISTS — безопасно повторять.
-DB_SCHEMA = """
+# Колонки location/quest дублируют сводку локации (HUD) из JSON — их удобно читать
+# SQL-запросами и отлаживать, а источником истины остаётся колонка data.
+DB_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS characters (
     user_id    INTEGER PRIMARY KEY,
     data       TEXT      NOT NULL,
+    location   TEXT      NOT NULL DEFAULT '{DEFAULT_LOCATION}',
+    quest      TEXT      NOT NULL DEFAULT '{DEFAULT_QUEST}',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -1615,7 +1816,8 @@ class BotDatabase:
     Постоянное хранилище состояния бота в локальном файле SQLite.
 
     Таблицы:
-        * characters   — сериализованный Character (JSON), по одной записи на игрока;
+        * characters   — сериализованный Character (JSON) + колонки сводки локации
+                         (location, quest), по одной записи на игрока;
         * chat_history — все сообщения игрока и Мастера (роли user / assistant).
 
     Соединение открывается лениво при первом обращении, переиспользуется и
@@ -1645,9 +1847,30 @@ class BotDatabase:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(DB_SCHEMA)
+        # Базы прежних версий не знали про сводку локации (location/quest) — дописываем колонки.
+        self._ensure_character_columns(conn)
         conn.commit()
         self._conn = conn
         return conn
+
+    # Колонки сводки локации (HUD), добавленные в схему позже.
+    _CHARACTER_HUD_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("location", f"TEXT NOT NULL DEFAULT '{DEFAULT_LOCATION}'"),
+        ("quest", f"TEXT NOT NULL DEFAULT '{DEFAULT_QUEST}'"),
+    )
+
+    @classmethod
+    def _ensure_character_columns(cls, conn: sqlite3.Connection) -> None:
+        """Дописывает недостающие колонки таблицы characters (ALTER TABLE, идемпотентно).
+
+        Нужно для баз, созданных прежними версиями бота: CREATE TABLE IF NOT EXISTS
+        новые колонки в уже существующую таблицу не добавляет. Вызывать под self._lock.
+        """
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(characters)")}
+        for name, definition in cls._CHARACTER_HUD_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE characters ADD COLUMN {name} {definition}")
+                logger.info("В таблицу characters добавлена колонка %s.", name)
 
     def init(self) -> None:
         """Создаёт файл базы, таблицы и индексы (идемпотентно)."""
@@ -1665,16 +1888,21 @@ class BotDatabase:
     # --- таблица characters ---
 
     def save_character(self, user_id: int, character: Character) -> None:
-        """Сохраняет (или обновляет) лист персонажа игрока."""
+        """Сохраняет (или обновляет) лист персонажа игрока.
+
+        Весь лист лежит в JSON-колонке data, а сводка локации (location/quest)
+        дополнительно дублируется в одноимённые колонки таблицы.
+        """
         payload = character.to_json()
         with self._lock:
             conn = self._connect()
             conn.execute(
-                "INSERT INTO characters (user_id, data, updated_at) "
-                "VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "INSERT INTO characters (user_id, data, location, quest, updated_at) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
                 "ON CONFLICT(user_id) DO UPDATE SET "
-                "data = excluded.data, updated_at = CURRENT_TIMESTAMP",
-                (int(user_id), payload),
+                "data = excluded.data, location = excluded.location, quest = excluded.quest, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (int(user_id), payload, character.location, character.quest),
             )
             conn.commit()
 
@@ -1682,12 +1910,18 @@ class BotDatabase:
         """Возвращает сохранённый лист персонажа или None, если записи ещё нет."""
         with self._lock:
             row = self._connect().execute(
-                "SELECT data FROM characters WHERE user_id = ?",
+                "SELECT data, location, quest FROM characters WHERE user_id = ?",
                 (int(user_id),),
             ).fetchone()
         if row is None:
             return None
-        return Character.from_json(row["data"])
+        character = Character.from_json(row["data"])
+        # Записи прежних версий бота не содержали сводки в JSON: берём её из колонок.
+        if not _json_has_key(row["data"], "location"):
+            character.location = (row["location"] or "").strip()[:120] or DEFAULT_LOCATION
+        if not _json_has_key(row["data"], "quest"):
+            character.quest = (row["quest"] or "").strip()[:120] or DEFAULT_QUEST
+        return character
 
     # --- таблица chat_history ---
 
@@ -1805,13 +2039,13 @@ def get_session(user_id: int) -> Session:
 
 
 # ---------------------------------------------------------------------------
-# 9. КЛИЕНТ DEEPSEEK (через официальный SDK openai)
+# 9. КЛИЕНТ GEMINI (через официальный SDK openai и OpenAI-совместимый эндпоинт Google)
 # ---------------------------------------------------------------------------
 
 # Клиент создаётся один раз; реальный ключ проверяется при запуске в main().
-openai_client: Optional[AsyncOpenAI] = (
-    AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-    if DEEPSEEK_API_KEY
+gemini_client: Optional[AsyncOpenAI] = (
+    AsyncOpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
+    if GEMINI_API_KEY
     else None
 )
 
@@ -1825,16 +2059,16 @@ async def ask_dungeon_master(history: Iterable[dict[str, str]]) -> str:
 
     :raise RuntimeError: если клиент не инициализирован или ответ пуст.
     """
-    if openai_client is None:
-        raise RuntimeError("DEEPSEEK_API_KEY не задан — клиент DeepSeek недоступен.")
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY не задан — клиент Gemini недоступен.")
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         *history,
     ]
 
-    response = await openai_client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
+    response = await gemini_client.chat.completions.create(
+        model=GEMINI_MODEL,
         messages=messages,
         temperature=DM_TEMPERATURE,
         max_tokens=DM_MAX_TOKENS,
@@ -1913,7 +2147,7 @@ async def _answer_with_dungeon_master(
     try:
         raw_reply = await ask_dungeon_master(session.messages())
     except APIError as error:
-        logger.error("Ошибка DeepSeek API: %s", error)
+        logger.error("Ошибка Gemini API: %s", error)
         await message.answer(API_ERROR_TEXT)
         return
     except Exception:  # noqa: BLE001 — на верхнем уровне бота логируем всё непредвиденное
@@ -1947,11 +2181,16 @@ async def _answer_with_dungeon_master(
         # Модель вернула только служебный блок — не оставляем игрока без реплики.
         reply = "Мастер молчаливо следит за происходящим.\n\nЧто ты делаешь?"
 
-    # 2) В память диалога кладём ТОЛЬКО чистый текст (без служебного JSON).
+    # 2) В память диалога кладём ТОЛЬКО чистый текст (без служебного JSON и сводки HUD).
     session.add("assistant", reply)
 
     # 3) Отправляем ответ Мастера с кнопками текущей фазы (создание героя или игра).
-    await send_long_message(message, reply, reply_markup=phase_keyboard(session.character))
+    #    В игре перед ответом идёт краткая сводка «📍 Локация / 🎯 Текущая цель» (HUD);
+    #    в память диалога она не попадает, чтобы не путать модель и не жечь токены.
+    outgoing = reply
+    if session.character.hero_confirmed:
+        outgoing = f"{format_hud(session.character)}\n\n{reply}"
+    await send_long_message(message, outgoing, reply_markup=phase_keyboard(session.character))
 
     # 4) …и сообщаем игроку об изменениях листа персонажа.
     if notes:
@@ -2257,11 +2496,14 @@ D20_BUTTON_PURPOSES: dict[str, str] = {
     "adv": "бросок d20 с преимуществом",
     "dis": "бросок d20 с помехой",
 }
+# Кнопки урона оружием: callback_data -> число граней кости (🗡 d6/d8/d10/d12).
+DAMAGE_DIE_SIDES: dict[str, int] = {"d6": 6, "d8": 8, "d10": 10, "d12": 12}
 
 
 @router.callback_query(F.data.startswith("roll:"))
 async def handle_roll_button(callback: CallbackQuery) -> None:
-    """Кнопки быстрых бросков: d20, d20 с преимуществом/помехой и бросок урона.
+    """Кнопки быстрых бросков: d20 (обычный/преимущество/помеха), кости урона d6/d8/d10/d12
+    и бросок урона снаряжённым оружием.
 
     Бросок считает код, результат показывается игроку, сохраняется в историю
     (память + SQLite) и передаётся Мастеру для описания исхода.
@@ -2272,7 +2514,11 @@ async def handle_roll_button(callback: CallbackQuery) -> None:
     if target is None:
         await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
         return
-    if action not in D20_BUTTON_PURPOSES and action != "damage":
+    if (
+        action not in D20_BUTTON_PURPOSES
+        and action not in DAMAGE_DIE_SIDES
+        and action != "damage"
+    ):
         await callback.answer(UNKNOWN_BUTTON_TEXT, show_alert=True)
         return
     # Гасим «часики» на кнопке — обязательно для любой CallbackQuery.
@@ -2281,7 +2527,10 @@ async def handle_roll_button(callback: CallbackQuery) -> None:
     message, user_id = target
     session = get_session(user_id)
 
-    if action == "damage":
+    if action in DAMAGE_DIE_SIDES:
+        roll, label = roll_damage_die(session.character, DAMAGE_DIE_SIDES[action])
+        context = roll.context_message(f"бросок урона {roll.notation} ({label})")
+    elif action == "damage":
         roll, label = roll_weapon_damage(session.character)
         context = roll.context_message(f"бросок урона ({label})")
     else:
@@ -2452,10 +2701,10 @@ async def main() -> None:
             "Не задан TELEGRAM_BOT_TOKEN.\n"
             "Создайте файл .env на основе .env.example и укажите токен от @BotFather."
         )
-    if not DEEPSEEK_API_KEY:
+    if not GEMINI_API_KEY:
         raise SystemExit(
-            "Не задан DEEPSEEK_API_KEY.\n"
-            "Создайте файл .env на основе .env.example и укажите ключ DeepSeek API."
+            "Не задан GEMINI_API_KEY.\n"
+            "Создайте файл .env на основе .env.example и укажите ключ Gemini API."
         )
 
     # parse_mode=None: ответы Мастера — «сырой» текст, чтобы разметка модели
@@ -2477,8 +2726,8 @@ async def main() -> None:
         )
     finally:
         # Корректно закрываем все сетевые сессии и соединение с базой.
-        if openai_client is not None:
-            await openai_client.close()
+        if gemini_client is not None:
+            await gemini_client.close()
         await bot.session.close()
         db.close()
         logger.info("Соединения закрыты. До встречи в подземелье!")
