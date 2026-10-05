@@ -57,6 +57,7 @@ import random
 import re
 import sqlite3
 import threading
+import time
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -65,7 +66,7 @@ from typing import Any, Iterable, Optional
 
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -77,7 +78,15 @@ from aiogram.types import (
     Message,
 )
 
-from openai import APIError, AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AsyncOpenAI,
+    InternalServerError,
+    RateLimitError,
+)
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from dnd2024_reference import (
     ABILITIES,
@@ -135,6 +144,11 @@ LLM_API_KEY = (
 LLM_BASE_URL = "https://api.deepseek.com"
 LLM_MODEL = "deepseek-chat"
 
+# Надёжность запросов к LLM: таймаут и повторы при временных сбоях.
+LLM_REQUEST_TIMEOUT = 60.0       # таймаут одного запроса к API, секунд
+LLM_MAX_ATTEMPTS = 4             # всего попыток: 1 запрос + 3 повтора
+LLM_RETRY_BASE_DELAY = 2.0       # базовая пауза между попытками, сек (удваивается)
+
 MAX_HISTORY_MESSAGES = 20        # сколько последних сообщений держим в памяти и грузим из БД
 DM_MAX_TOKENS = 1200             # лимит длины ответа Мастера
 DM_TEMPERATURE = 1.15            # чуть выше 1.0 — для более образного и «живого» текста
@@ -159,6 +173,57 @@ logger = logging.getLogger("dnd-dm-bot")
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
+# 2.1 ОГРАНИЧЕНИЕ ДОСТУПА И ЧАСТОТЫ (белый список и антифлуд)
+# ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    """Читает целое число из переменной окружения (при ошибке — значение по умолчанию)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        logger.warning("Переменная %s=%r не является числом — беру %d.", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Читает число с плавающей точкой из окружения (при ошибке — значение по умолчанию)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        logger.warning("Переменная %s=%r не является числом — беру %r.", name, raw, default)
+        return default
+
+
+def _parse_id_set(value: str) -> frozenset[int]:
+    """Разбирает список Telegram user id из строки (через запятую или пробелы)."""
+    ids: set[int] = set()
+    for chunk in re.split(r"[\s,]+", value or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if chunk.isdigit():
+            ids.add(int(chunk))
+        else:
+            logger.warning("Игнорирую некорректный user id: %r.", chunk)
+    return frozenset(ids)
+
+
+# Белый список игроков (пусто — пускаем всех) и администраторы (обходят лимиты).
+ALLOWED_USER_IDS = _parse_id_set(os.getenv("ALLOWED_USER_IDS", ""))
+ADMIN_USER_IDS = _parse_id_set(os.getenv("ADMIN_USER_IDS", ""))
+
+# Ограничение частоты обращений на пользователя (скользящее окно).
+RATE_LIMIT_MAX_REQUESTS = _env_int("RATE_LIMIT_MAX_REQUESTS", 20)
+RATE_LIMIT_WINDOW_SECONDS = _env_float("RATE_LIMIT_WINDOW_SECONDS", 60.0)
+
+# ---------------------------------------------------------------------------
 # 3. СИСТЕМНЫЙ ПРОМПТ (DUNGEON MASTER)
 # ---------------------------------------------------------------------------
 
@@ -181,12 +246,14 @@ BASE_DM_PROMPT = """
   и названия правил в художественной прозе.
 - Пиши ОБЫЧНЫМ текстом без Markdown-разметки: не используй символы *, _, `, # и HTML-теги.
 
-# ДИНАМИЧЕСКИЙ ОБЪЁМ И СТИЛЬ ОТВЕТОВ (ВАЖНО!)
-Твой стиль и длина ответа зависят от текущей ситуации:
-- Сюжет, исследование и диалоги: будь литературным Рассказчиком. Давай красивые, атмосферные
-  и глубокие описания (2-3 абзаца). Описывай запахи, звуки, освещение и эмоции NPC.
-- Механика, броски и бой: будь строгим Судьей. Переключайся на максимально краткий, сухой и
-  технический стиль (1-2 коротких предложения). Никакой воды, только факты.
+# ДИНАМИЧЕСКИЙ ОБЪЁМ, СТИЛЬ И ЗАВЕРШЕНИЕ ФРАЗЫ (ВАЖНО!)
+Твой стиль, длина ответа и финальная фраза зависят от текущей ситуации:
+- ВНЕ БОЯ (исследование, диалоги, осмотр местности): отвечай развёрнуто, красиво и литературно
+  (минимум 2-3 абзаца). Описывай детали, атмосферу, запахи, звуки, освещение и эмоции NPC.
+  В конце ТАКИХ сообщений КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО писать боевые фразы вроде «Твой ход».
+  Заканчивай естественно: «Что будешь делать?», «Куда направишься?» или вопросом от NPC.
+- В БОЮ: отвечай кратко, сухо и технично (1-2 коротких абзаца). ТОЛЬКО в бою уместно
+  заканчивать сообщение фразой «Твой ход».
 НИКОГДА не превышай 6 абзацев за одну реплику.
 
 # ЖЕЛЕЗНЫЕ ПРАВИЛА
@@ -290,6 +357,28 @@ BASE_DM_PROMPT = """
   где X — полученный игроком урон (положительное число). Если враг промахнулся — урон не наноси
   и "hp_change" НЕ добавляй (если нет других изменений листа персонажа).
 
+# СТРОГИЙ УЧЁТ ОРУЖИЯ И КОСТЕЙ УРОНА (ОБЯЗАТЕЛЬНО)
+- Прежде чем попросить игрока бросить кости на урон, ты ОБЯЗАН свериться с его листом персонажа /
+  инвентарём и определить его ТЕКУЩЕЕ оружие (используй данные из справочника правил ниже).
+- Называй игроку ТОЛЬКО ту кость урона, которая соответствует его текущему оружию: например,
+  если экипировано оружие с уроном 1d8 — проси 1d8, и ты НЕ имеешь права просить 1d10.
+- Никогда не меняй кости урона на ходу и не подменяй их «на глаз». Если оружие неочевидно или
+  двуручное/универсальное — уточни у игрока, каким именно оружием он бьёт, и только потом проси
+  соответствующую кость.
+
+# ПРАВИЛО ОРУЖЕЙНЫХ ПРИЁМОВ (WEAPON MASTERY) — НИКОГДА НЕ ЗАБЫВАЙ
+- Во время боевых действий ты ОБЯЗАН всегда проверять наличие свойства «Приём (Mastery)» у
+  экипированного оружия игрока (например: Cleave, Graze, Nick, Push, Sap, Slow, Topple, Vex —
+  их описания есть в справочнике правил ниже).
+- При успешном попадании игрока ты должен АВТОМАТИЧЕСКИ применять механику этого приёма:
+  описывать его эффект в нарративе и учитывать его последствия для врагов или самого игрока в
+  следующем раунде (Topple — спасбросок ТЕЛ, цель падает ничком; Vex — преимущество на следующую
+  атаку по этой цели; Sap — помеха на следующий бросок атаки цели; Push — цель отталкивается;
+  Cleave — урон второму существу рядом; Graze — урон модификатором при промахе; Slow — снижение
+  скорости цели; Nick — доп. атака лёгким оружием без бонусного действия).
+- Никогда не забывай про Приёмы оружия: каждый раз при попадании сверяйся со свойством Mastery
+  оружия из листа персонажа.
+
 # ФАЗА БОЯ: ДЕТАЛИ БОЕВОГО ЦИКЛА (Combat Turn Loop) — ОБЯЗАТЕЛЬНО К ИСПОЛНЕНИЮ
 - Бой ведётся строгим циклом ходов (см. «ПРАВИЛО ПОШАГОВОСТИ БОЯ» выше). Когда игрок объявляет
   атаку, ты не имеешь права описать её одним абзацем и оставить врага без ответа — ты обязан
@@ -334,8 +423,12 @@ BASE_DM_PROMPT = """
   состоянию: он возвращается в игру с последствиями — долгом культу, меткой смерти, потерей добра.
 
 # ЗАВЕРШЕНИЕ ХОДА
-- Каждую свою реплику обязательно заканчивай прямым вопросом игроку: «Что ты делаешь?»
-  В фазе создания персонажа вместо этого задай вопрос о герое (имя, вид, класс, подтверждение).
+- ВНЕ БОЯ каждую свою реплику заканчивай естественным вопросом, который ведёт историю дальше:
+  «Что будешь делать?», «Куда направишься?» или вопросом от лица NPC. Боевые фразы вроде
+  «Твой ход» здесь КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНЫ.
+- В БОЮ завершай ход фразой «Твой ход, что делаешь?» (см. «ПРАВИЛО УРОНА ИГРОКА И ОТВЕТНОГО
+  ХОДА ВРАГА» выше).
+- В фазе создания персонажа вместо этого задай вопрос о герое (имя, вид, класс, подтверждение).
 """.strip()
 
 # Инструкция о скрытом служебном блоке изменений листа персонажа.
@@ -549,6 +642,17 @@ API_ERROR_TEXT = (
 
 GENERIC_ERROR_TEXT = (
     "⚠️ Что-то пошло не так при обработке твоего действия. Попробуй ещё раз."
+)
+
+# Сообщения системы доступа: белый список и превышение лимита обращений.
+ACCESS_DENIED_TEXT = (
+    "🔒 Извини, бот закрыт для посторонних. "
+    "Попроси владельца добавить твой Telegram ID в список доступа."
+)
+
+RATE_LIMIT_TEXT = (
+    "⏳ Слишком много сообщений подряд. "
+    "Подожди несколько секунд и повтори — так Мастер успеет ответить как следует."
 )
 
 # ---------------------------------------------------------------------------
@@ -1647,6 +1751,57 @@ CONTROL_BLOCK_KEYS = frozenset(
     }
 )
 
+
+class ControlBlock(BaseModel):
+    """Строгая схема служебного JSON-блока Мастера.
+
+    Неизвестные ключи отбрасываются (``extra="ignore"``), а известные приводятся
+    к ожидаемому типу (например, ``"5"`` -> ``5``). Отсутствующие поля остаются
+    ``None`` и в итоговый словарь не попадают.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Создание и правка листа персонажа.
+    name: Optional[str] = None
+    race: Optional[str] = None
+    class_name: Optional[str] = None
+    description: Optional[str] = None
+    level: Optional[int] = None
+    abilities: Optional[dict[str, int]] = None
+    max_hp: Optional[int] = None
+    current_hp: Optional[int] = None
+    heroic_inspiration: Optional[bool] = None
+    location: Optional[str] = None
+    quest: Optional[str] = None
+
+    # Разовые изменения листа (опыт, урон, предметы, золото).
+    xp_gained: Optional[int] = None
+    hp_change: Optional[int] = None
+    add_items: Optional[list[str]] = None
+    remove_items: Optional[list[str]] = None
+    gp_change: Optional[int] = None
+
+
+def validate_control_block(data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Приводит служебный блок Мастера к схеме :class:`ControlBlock`.
+
+    Возвращает нормализованный словарь без пустых полей. Если блок не проходит
+    проверку целиком, возвращаем его как есть: ``apply_control`` сам защищается
+    от «мусора», поэтому падения не будет — только предупреждение в логе.
+
+    :return: нормализованный словарь, исходный словарь (fallback) или None, если
+        после нормализации не осталось ни одного значимого поля.
+    """
+    try:
+        model = ControlBlock.model_validate(data)
+    except ValidationError as error:
+        logger.warning("Служебный блок Мастера не прошёл валидацию, беру как есть: %s", error)
+        return data
+
+    cleaned = model.model_dump(exclude_none=True)
+    return cleaned or None
+
 # Служебный блок в тройных обратных кавычках (``` или ```json).
 FENCED_JSON_PATTERN = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 
@@ -1740,6 +1895,13 @@ def extract_control_block(text: str) -> tuple[str, Optional[dict]]:
     # Убираем «осиротевшие» пустые блоки кода и лишние пустые строки.
     clean = re.sub(r"```(?:json)?\s*```", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\n{3,}", "\n\n", clean)
+
+    # Прогоняем блок через Pydantic-схему: типы приводятся к ожидаемым, лишние поля
+    # отбрасываются (см. validate_control_block). Падения быть не может — при
+    # неудаче возвращается исходный словарь.
+    if control is not None:
+        control = validate_control_block(control)
+
     return clean.strip(), control
 
 
@@ -1748,29 +1910,78 @@ def extract_control_block(text: str) -> tuple[str, Optional[dict]]:
 # ---------------------------------------------------------------------------
 
 # Сетка кнопок под каждым ответом Мастера (callback_data разбирают хэндлеры ниже).
-ACTION_KEYBOARD = InlineKeyboardMarkup(
-    inline_keyboard=[
+# Ряд урона строится по фактически экипированному оружию игрока, чтобы нельзя было
+# случайно нажать «не ту» кость: показываем только кость текущего оружия.
+
+
+def _damage_die_sides(damage_dice: str) -> Optional[int]:
+    """Число граней единственной кости урона («1d8» -> 8) или None.
+
+    None, если кость не одна (например, «2d6») или урон задан числом («1»).
+    """
+    match = DICE_PATTERN.match(damage_dice.strip())
+    if match is None or int(match.group("count") or 1) != 1:
+        return None
+    return int(match.group("sides"))
+
+
+def _weapon_damage_button(character: Character) -> Optional[InlineKeyboardButton]:
+    """Кнопка урона текущим оружием героя или None, если её показывать не нужно.
+
+    Кнопка строится только для оружия с одной костью урона (d4/d6/d8/d10/d12).
+    Для оружия с несколькими костями (например, 2d6) или фиксированным уроном
+    (духовая трубка) остаётся общая кнопка «🎲 Бросок урона».
+    """
+    weapon = find_inventory_weapon(character)
+    if weapon is None:
+        # Оружия нет — импровизированная атака 1d4 дробящего урона.
+        return InlineKeyboardButton(
+            text=f"🗡 {IMPROVISED_DAMAGE_DICE} (без оружия)",
+            callback_data="roll:d4",
+        )
+
+    _name, damage_dice, damage_type, _kind = weapon
+    sides = _damage_die_sides(damage_dice)
+    action = f"d{sides}" if sides is not None else ""
+    # Показываем кнопку только для известных костей урона: иначе остаётся общая
+    # кнопка «🎲 Бросок урона», и мы не столкнёмся с callback-данными вроде «d20».
+    if action not in DAMAGE_DIE_SIDES:
+        return None
+    return InlineKeyboardButton(
+        text=f"🗡 {damage_dice} {damage_type}",
+        callback_data=f"roll:{action}",
+    )
+
+
+def build_action_keyboard(character: Character) -> InlineKeyboardMarkup:
+    """Игровая сетка кнопок с учётом экипированного оружия героя.
+
+    ``callback_data`` строки урона — «roll:dN» (кости d4/d6/d8/d10/d12),
+    их разбирает обработчик ``handle_roll_button``.
+    """
+    rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(text="🎲 d20", callback_data="roll:d20"),
             InlineKeyboardButton(text="🎲 d20 с преим.", callback_data="roll:adv"),
             InlineKeyboardButton(text="🎲 d20 с помех.", callback_data="roll:dis"),
         ],
-        [
-            InlineKeyboardButton(text="🗡 1d6", callback_data="roll:d6"),
-            InlineKeyboardButton(text="🗡 1d8", callback_data="roll:d8"),
-            InlineKeyboardButton(text="🗡 1d10", callback_data="roll:d10"),
-            InlineKeyboardButton(text="🗡 1d12", callback_data="roll:d12"),
-        ],
+    ]
+
+    damage_button = _weapon_damage_button(character)
+    if damage_button is not None:
+        rows.append([damage_button])
+
+    rows.append(
         [
             InlineKeyboardButton(text="📜 Лист", callback_data="sheet"),
             InlineKeyboardButton(text="🎒 Инвентарь", callback_data="inventory"),
             InlineKeyboardButton(text="🎲 Бросок урона", callback_data="roll:damage"),
-        ],
-        [
-            InlineKeyboardButton(text="🧠 Проверки по статам", callback_data="checks"),
-        ],
-    ]
-)
+        ]
+    )
+    rows.append(
+        [InlineKeyboardButton(text="🧠 Проверки по статам", callback_data="checks")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_checks_keyboard(character: Character) -> InlineKeyboardMarkup:
@@ -1802,8 +2013,8 @@ CREATION_KEYBOARD = InlineKeyboardMarkup(
 
 
 def phase_keyboard(character: Character) -> InlineKeyboardMarkup:
-    """Клавиатура по фазе игры: создание героя или обычные игровые кнопки."""
-    return ACTION_KEYBOARD if character.hero_confirmed else CREATION_KEYBOARD
+    """Клавиатура по фазе игры: создание героя или игровые кнопки героя."""
+    return build_action_keyboard(character) if character.hero_confirmed else CREATION_KEYBOARD
 
 
 # ---------------------------------------------------------------------------
@@ -2077,11 +2288,69 @@ def get_session(user_id: int) -> Session:
 # ---------------------------------------------------------------------------
 
 # Клиент создаётся один раз; реальный ключ проверяется при запуске в main().
+# timeout — таймаут одного запроса, max_retries=0 — повторы реализованы ниже сами,
+# чтобы их было видно в логах бота (см. _create_chat_completion).
 llm_client: Optional[AsyncOpenAI] = (
-    AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    AsyncOpenAI(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        timeout=LLM_REQUEST_TIMEOUT,
+        max_retries=0,
+    )
     if LLM_API_KEY
     else None
 )
+
+# Ошибки, которые имеет смысл повторить: таймауты, обрывы связи, лимит (429)
+# и серверные ошибки (5xx). Прочие 4xx (например, 401 из-за ключа) не повторяем.
+_RETRYABLE_LLM_ERRORS = (
+    APITimeoutError,
+    APIConnectionError,
+    RateLimitError,
+    InternalServerError,
+)
+
+
+async def _create_chat_completion(messages: list[dict[str, str]]):
+    """Отправляет запрос к LLM, повторяя его при временных сбоях.
+
+    Повторы выполняются с экспоненциальной задержкой (LLM_RETRY_BASE_DELAY,
+    удваивается с каждой попыткой) до LLM_MAX_ATTEMPTS попыток.
+
+    :raise RuntimeError: если клиент LLM не инициализирован.
+    :raise APIError: если все попытки исчерпаны — пробрасывается последняя ошибка.
+    """
+    if llm_client is None:
+        raise RuntimeError("LLM_API_KEY не задан — клиент LLM недоступен.")
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+        try:
+            return await llm_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                temperature=DM_TEMPERATURE,
+                max_tokens=DM_MAX_TOKENS,
+                stream=False,
+            )
+        except _RETRYABLE_LLM_ERRORS as error:
+            last_error = error
+            if attempt >= LLM_MAX_ATTEMPTS:
+                break
+            delay = LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning(
+                "Временный сбой LLM (%s): попытка %d/%d, повтор через %.1f с",
+                type(error).__name__,
+                attempt,
+                LLM_MAX_ATTEMPTS,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    # Сюда попадаем, только если все попытки провалились: цикл либо вернул ответ,
+    # либо задал last_error перед выходом.
+    assert last_error is not None
+    raise last_error
 
 
 async def ask_dungeon_master(history: Iterable[dict[str, str]]) -> str:
@@ -2089,9 +2358,11 @@ async def ask_dungeon_master(history: Iterable[dict[str, str]]) -> str:
     Отправляет историю диалога Мастеру и возвращает текст ответа.
 
     Системный промпт добавляется к каждому запросу, а сама история уже
-    ограничена по длине (см. Session).
+    ограничена по длине (см. Session). Запрос выполняется с повторами при
+    временных сбоях (см. _create_chat_completion).
 
     :raise RuntimeError: если клиент не инициализирован или ответ пуст.
+    :raise APIError: если LLM недоступен даже после повторов.
     """
     if llm_client is None:
         raise RuntimeError("LLM_API_KEY не задан — клиент LLM недоступен.")
@@ -2101,13 +2372,7 @@ async def ask_dungeon_master(history: Iterable[dict[str, str]]) -> str:
         *history,
     ]
 
-    response = await llm_client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        temperature=DM_TEMPERATURE,
-        max_tokens=DM_MAX_TOKENS,
-        stream=False,
-    )
+    response = await _create_chat_completion(messages)
 
     content = response.choices[0].message.content
     if not content or not content.strip():
@@ -2162,6 +2427,68 @@ async def send_long_message(
 # ---------------------------------------------------------------------------
 
 router = Router()
+
+
+class RateLimiter:
+    """Ограничитель частоты обращений на пользователя (скользящее окно)."""
+
+    def __init__(self, max_requests: int, window_seconds: float) -> None:
+        self._max = max(1, int(max_requests))
+        self._window = max(1.0, float(window_seconds))
+        self._hits: dict[int, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, user_id: int) -> bool:
+        """True, если запрос можно обработать; False — лимит превышен."""
+        now = time.monotonic()
+        with self._lock:
+            hits = self._hits.setdefault(user_id, deque())
+            while hits and now - hits[0] > self._window:
+                hits.popleft()
+            if len(hits) >= self._max:
+                return False
+            hits.append(now)
+            return True
+
+
+_rate_limiter = RateLimiter(RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
+
+
+async def _reject_event(event: Any, text: str) -> None:
+    """Сообщает пользователю об отказе (текстом или всплывающим окном кнопки)."""
+    try:
+        if isinstance(event, CallbackQuery):
+            await event.answer(text, show_alert=True)
+        else:
+            await event.answer(text)
+    except Exception:  # noqa: BLE001 — отказ не должен ломать обработку апдейтов
+        logger.exception("Не удалось отправить сообщение об отказе")
+
+
+class AccessAndRateLimitMiddleware(BaseMiddleware):
+    """Отсекает посторонних (белый список) и слишком частые обращения.
+
+    Если задан ALLOWED_USER_IDS, общаться с ботом могут только эти пользователи.
+    Администраторы из ADMIN_USER_IDS обходят ограничение частоты, но по-прежнему
+    должны входить в белый список, если он задан.
+    """
+
+    async def __call__(self, handler, event, data):
+        user_id = getattr(getattr(event, "from_user", None), "id", None)
+        if user_id is None:
+            return await handler(event, data)
+
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            logger.warning("Отказ в доступе пользователю %s (нет в белом списке)", user_id)
+            await _reject_event(event, ACCESS_DENIED_TEXT)
+            return None
+
+        if user_id not in ADMIN_USER_IDS and not _rate_limiter.allow(user_id):
+            logger.warning("Пользователь %s превысил лимит обращений", user_id)
+            await _reject_event(event, RATE_LIMIT_TEXT)
+            return None
+
+        return await handler(event, data)
 
 
 async def _answer_with_dungeon_master(
@@ -2364,7 +2691,10 @@ async def handle_random_hero(message: Message) -> None:
         return
     session = get_session(message.from_user.id)
     if session.character.hero_confirmed:
-        await message.answer(HERO_ALREADY_CONFIRMED_TEXT, reply_markup=ACTION_KEYBOARD)
+        await message.answer(
+            HERO_ALREADY_CONFIRMED_TEXT,
+            reply_markup=build_action_keyboard(session.character),
+        )
         return
 
     await _create_random_hero(message, session)
@@ -2519,8 +2849,12 @@ async def handle_menu_button(callback: CallbackQuery) -> None:
         return
     await callback.answer()
 
-    message, _user_id = target
-    await message.answer(ACTION_MENU_TEXT, reply_markup=ACTION_KEYBOARD)
+    message, user_id = target
+    session = get_session(user_id)
+    await message.answer(
+        ACTION_MENU_TEXT,
+        reply_markup=build_action_keyboard(session.character),
+    )
 
 
 # Кнопки бросков: callback_data -> (режим d20, подпись для Мастера).
@@ -2530,8 +2864,8 @@ D20_BUTTON_PURPOSES: dict[str, str] = {
     "adv": "бросок d20 с преимуществом",
     "dis": "бросок d20 с помехой",
 }
-# Кнопки урона оружием: callback_data -> число граней кости (🗡 d6/d8/d10/d12).
-DAMAGE_DIE_SIDES: dict[str, int] = {"d6": 6, "d8": 8, "d10": 10, "d12": 12}
+# Кнопки урона оружием: callback_data -> число граней кости (🗡 d4/d6/d8/d10/d12).
+DAMAGE_DIE_SIDES: dict[str, int] = {"d4": 4, "d6": 6, "d8": 8, "d10": 10, "d12": 12}
 
 
 @router.callback_query(F.data.startswith("roll:"))
@@ -2709,7 +3043,7 @@ async def handle_unsupported(message: Message) -> None:
         "Я понимаю только текст и кнопки. Опиши своё действие словами, нажми кнопку "
         "быстрого броска (🎲 d20, 🎲 Бросок урона, 🧠 Проверки по статам) "
         "или используй команды /roll, /sheet, /inventory, /check.",
-        reply_markup=ACTION_KEYBOARD,
+        reply_markup=build_action_keyboard(session.character),
     )
 
 
@@ -2746,6 +3080,18 @@ async def main() -> None:
     bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
+
+    # Белый список и ограничение частоты: применяем к сообщениям и нажатиям кнопок.
+    access_middleware = AccessAndRateLimitMiddleware()
+    dispatcher.message.outer_middleware(access_middleware)
+    dispatcher.callback_query.outer_middleware(access_middleware)
+    logger.info(
+        "Доступ: %s; лимит %d запросов за %.0f с (админов: %d).",
+        "белый список" if ALLOWED_USER_IDS else "все пользователи",
+        RATE_LIMIT_MAX_REQUESTS,
+        RATE_LIMIT_WINDOW_SECONDS,
+        len(ADMIN_USER_IDS),
+    )
 
     # Готовим постоянное хранилище: создаём bot_database.db, таблицы и индексы.
     db.init()
