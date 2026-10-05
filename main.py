@@ -4,7 +4,7 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
 Стек:
     * Python 3
     * aiogram 3.x      — асинхронный фреймворк для Telegram Bot API
-    * openai (SDK)     — обращение к Gemini API по OpenAI-совместимому интерфейсу Google
+    * openai (SDK)       — обращение к Groq API (OpenAI-совместимый интерфейс)
     * python-dotenv    — загрузка переменных окружения из файла .env
     * sqlite3 (stdlib) — постоянное хранение сессий в файле bot_database.db
 
@@ -120,18 +120,19 @@ load_dotenv(ENV_PATH)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Ключ Gemini API. Читаем из переменной окружения GEMINI_API_KEY (допустим также
-# алиас GOOGLE_API_KEY). Секреты в коде не храним: укажите ключ в файле .env
-# (локально) или в переменных окружения сервера. Проверка наличия ключа — в main().
-GEMINI_API_KEY = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("GOOGLE_API_KEY")
+# Ключ Groq API (OpenAI-совместимый эндпоинт). Читаем из переменной окружения
+# GROQ_API_KEY, но для совместимости поддерживаем и старое имя GEMINI_API_KEY,
+# если оно уже задано в хостинге. Секреты в коде не храним: укажите ключ в файле
+# .env (локально) или в переменных окружения сервера. Проверка наличия — в main().
+GROQ_API_KEY = (
+    os.getenv("GROQ_API_KEY")
+    or os.getenv("GEMINI_API_KEY")
     or ""
 ).strip()
 
-# LLM через OpenRouter (OpenAI-совместимый эндпоинт). Бесплатная модель.
-GEMINI_BASE_URL = "https://openrouter.ai/api/v1"
-GEMINI_MODEL = "google/gemma-4-31b-it:free"
+# LLM через Groq API (OpenAI-совместимый эндпоинт). Сверхбыстрая модель Llama 3.3 70B.
+LLM_BASE_URL = "https://api.groq.com/openai/v1"
+LLM_MODEL = "llama-3.3-70b-versatile"
 
 MAX_HISTORY_MESSAGES = 20        # сколько последних сообщений держим в памяти и грузим из БД
 DM_MAX_TOKENS = 1200             # лимит длины ответа Мастера
@@ -509,7 +510,7 @@ DM_ROLL_INSTRUCTION = (
 )
 
 API_ERROR_TEXT = (
-    "⚠️ Мастер ненадолго отвлёкся: не удалось связаться с оракулом (ошибка Gemini API).\n"
+    "⚠️ Мастер ненадолго отвлёкся: не удалось связаться с оракулом.\n"
     "Попробуй повторить сообщение через несколько секунд."
 )
 
@@ -2039,13 +2040,13 @@ def get_session(user_id: int) -> Session:
 
 
 # ---------------------------------------------------------------------------
-# 9. КЛИЕНТ GEMINI (через официальный SDK openai и OpenAI-совместимый эндпоинт Google)
+# 9. КЛИЕНТ LLM (Groq API через официальный SDK openai, OpenAI-совместимый эндпоинт)
 # ---------------------------------------------------------------------------
 
 # Клиент создаётся один раз; реальный ключ проверяется при запуске в main().
-gemini_client: Optional[AsyncOpenAI] = (
-    AsyncOpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
-    if GEMINI_API_KEY
+llm_client: Optional[AsyncOpenAI] = (
+    AsyncOpenAI(api_key=GROQ_API_KEY, base_url=LLM_BASE_URL)
+    if GROQ_API_KEY
     else None
 )
 
@@ -2059,16 +2060,16 @@ async def ask_dungeon_master(history: Iterable[dict[str, str]]) -> str:
 
     :raise RuntimeError: если клиент не инициализирован или ответ пуст.
     """
-    if gemini_client is None:
-        raise RuntimeError("GEMINI_API_KEY не задан — клиент Gemini недоступен.")
+    if llm_client is None:
+        raise RuntimeError("GROQ_API_KEY не задан — клиент LLM недоступен.")
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         *history,
     ]
 
-    response = await gemini_client.chat.completions.create(
-        model=GEMINI_MODEL,
+    response = await llm_client.chat.completions.create(
+        model=LLM_MODEL,
         messages=messages,
         temperature=DM_TEMPERATURE,
         max_tokens=DM_MAX_TOKENS,
@@ -2147,7 +2148,7 @@ async def _answer_with_dungeon_master(
     try:
         raw_reply = await ask_dungeon_master(session.messages())
     except APIError as error:
-        logger.error("Ошибка Gemini API: %s", error)
+        logger.error("Ошибка LLM / Groq API: %s", error)
         await message.answer(API_ERROR_TEXT)
         return
     except Exception:  # noqa: BLE001 — на верхнем уровне бота логируем всё непредвиденное
@@ -2701,10 +2702,10 @@ async def main() -> None:
             "Не задан TELEGRAM_BOT_TOKEN.\n"
             "Создайте файл .env на основе .env.example и укажите токен от @BotFather."
         )
-    if not GEMINI_API_KEY:
+    if not GROQ_API_KEY:
         raise SystemExit(
-            "Не задан GEMINI_API_KEY.\n"
-            "Создайте файл .env на основе .env.example и укажите ключ Gemini API."
+            "Не задан GROQ_API_KEY.\n"
+            "Создайте файл .env на основе .env.example и укажите ключ Groq API."
         )
 
     # parse_mode=None: ответы Мастера — «сырой» текст, чтобы разметка модели
@@ -2726,8 +2727,8 @@ async def main() -> None:
         )
     finally:
         # Корректно закрываем все сетевые сессии и соединение с базой.
-        if gemini_client is not None:
-            await gemini_client.close()
+        if llm_client is not None:
+            await llm_client.close()
         await bot.session.close()
         db.close()
         logger.info("Соединения закрыты. До встречи в подземелье!")
