@@ -7,6 +7,7 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
     * openai (SDK)       — обращение к официальному API DeepSeek (OpenAI-совместимый)
     * python-dotenv    — загрузка переменных окружения из файла .env
     * sqlite3 (stdlib) — постоянное хранение сессий в файле bot_database.db
+      (рядом с main.py или в каталоге из переменной окружения DATA_DIR — см. ниже)
 
 Команды:
     /start     — приветствие, сброс прошлой сессии и создание героя
@@ -152,11 +153,21 @@ from dnd2024_reference import (
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 
-# Локальная база данных SQLite с листами персонажей и историей диалогов.
-DB_PATH = BASE_DIR / "bot_database.db"
-
 # Загружаем переменные окружения из .env (если файла нет — берём из окружения ОС).
 load_dotenv(ENV_PATH)
+
+# Локальная база данных SQLite с листами персонажей и историей диалогов.
+# На хостинге каталог проекта пересобирается при каждом деплое, поэтому файл базы
+# держим ВНЕ образа: если задана переменная окружения DATA_DIR (например, путь к
+# смонтированному volume), база хранится там и переживает пересборку контейнера;
+# если DATA_DIR пуста — как и раньше, рядом с main.py (удобно локально).
+DATA_DIR_ENV = os.getenv("DATA_DIR", "").strip()
+if DATA_DIR_ENV:
+    DATA_DIR_PATH = Path(DATA_DIR_ENV)
+    DATA_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    DB_PATH = DATA_DIR_PATH / "bot_database.db"
+else:
+    DB_PATH = BASE_DIR / "bot_database.db"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -3011,6 +3022,8 @@ class BotDatabase:
         if self._conn is not None:
             return self._conn
 
+        # Гарантируем, что каталог базы существует: DB_PATH.parent может указывать
+        # на смонтированный volume (DATA_DIR) и быть созданным заранее лишь частично.
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False: доступ сериализуем собственным Lock'ом,
         # поэтому соединение можно при необходимости трогать из другого потока.
