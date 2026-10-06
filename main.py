@@ -16,6 +16,17 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
     /sheet     — показать лист персонажа (имя, класс, HP, характеристики, снаряжение)
     /inventory — список снаряжения и золота
     /check     — меню проверок характеристик (СИЛ/ЛОВ/ТЕЛ/ИНТ/МУД/ХАР)
+    /spells    — книга заклинаний: ячейки, применение и подготовка заклинаний
+    /rest      — отдых: короткий (1 час) и продолжительный (8 часов), восстановление ячеек
+
+ЭТАП 0 — выбор сеттинга (мира игры):
+    Прежде чем описывать героя, игрок выбирает мир кнопками «🎲 Забытые Королевства (D&D)»
+    или «⚔️ Вселенная Warcraft (Азерот)» (callback_data «setting:dnd_classic» /
+    «setting:warcraft»). Выбор хранится в поле setting листа персонажа. Для сеттинга
+    Warcraft в системный промпт Мастера подмешивается хроника Азерота из файла
+    warcraft_lore.txt (копия «вов.txt», см. build_system_prompt): правила боёвки, броски
+    и лист персонажа остаются по D&D 2024, а мир, фракции, локации, монстры и NPC
+    берутся строго из хроники (эпоха Третьей Войны, 20–27 гг. ADP).
 
 ЭТАП 1 — создание персонажа:
     Новая игра начинается не с пролога, а с создания героя. В первом ответе Мастер
@@ -33,6 +44,10 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
     📜 Лист / 🎒 Инвентарь / 🎲 Бросок урона    — лист, снаряжение, урон оружием
     🧠 Проверки по статам                      — меню проверок d20 + модификатор
     🎲 Случайный герой / ✅ Подтвердить героя    — кнопки этапа создания персонажа
+    🌍 Выбор мира                              — повторный выбор сеттинга при создании героя
+    🎲 Забытые Королевства / ⚔️ Вселенная Warcraft — выбор сеттинга (мира игры) в начале
+                                                  создания героя; «setting:dnd_classic»
+                                                  и «setting:warcraft» в callback_data
     Любое нажатие пишется в историю и SQLite так же, как обычная команда игрока.
 
 Любое другое текстовое сообщение воспринимается как действие игрока
@@ -40,7 +55,10 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
 
 Хранение данных:
     В локальной базе bot_database.db (в корне проекта) две таблицы:
-        * characters   — сериализованный лист персонажа, по одному на игрока;
+        * characters   — сериализованный лист персонажа, по одному на игрока; колонки
+                         location, quest и setting дублируют сводку HUD (локация, цель)
+                         и выбранный сеттинг партии для удобной отладки SQL-запросами
+                         (источник истины — JSON в колонке data);
         * chat_history — лог переписки (роли user / assistant).
     При первом обращении игрока загружаются его Character и последние
     MAX_HISTORY_MESSAGES сообщений; каждое изменение листа и каждое сообщение
@@ -61,6 +79,7 @@ import time
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -96,19 +115,31 @@ from dnd2024_reference import (
     CLASSES,
     MAX_LEVEL,
     SHIELD_BONUS,
+    SPELL_LEVEL_RU,
     SPECIES,
     WEAPONS,
     ability_modifier,
     ability_priority_for_class,
     average_hit_points,
     build_reference_digest,
+    class_cantrip_list,
     class_name_from_text,
+    class_spell_list,
+    default_cantrips_for_class,
+    default_known_spells_for_class,
     format_modifier,
     hit_die_sides,
+    is_pact_caster,
+    is_spellcaster_class,
+    is_spontaneous_caster,
+    max_prepared_spells,
     next_xp_threshold,
     normalize_ability_key,
     proficiency_bonus,
     species_name,
+    spell_level,
+    spell_slots_for_level,
+    spellcasting_ability_for_class,
     standard_array_for_class,
     starter_equipment_for_class,
     starting_gold_for_class,
@@ -173,7 +204,95 @@ logger = logging.getLogger("dnd-dm-bot")
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
-# 2.1 ОГРАНИЧЕНИЕ ДОСТУПА И ЧАСТОТЫ (белый список и антифлуд)
+# 2.1 СЕТТИНГИ И БАЗА ЗНАНИЙ МИРОВ (choosing the world: D&D или Warcraft)
+# ---------------------------------------------------------------------------
+
+# Сеттинг партии: классический D&D (Забытые Королевства) или вселенная Warcraft
+# (Азерот, эпоха Третьей Войны, 20–27 гг. ADP). Выбор хранится в листе персонажа
+# (см. Character.setting) и влияет на системный промпт Мастера.
+SETTING_DND_CLASSIC = "dnd_classic"
+SETTING_WARCRAFT = "warcraft"
+SETTING_CHOICES: tuple[str, ...] = (SETTING_DND_CLASSIC, SETTING_WARCRAFT)
+
+# Префикс callback_data кнопок выбора сеттинга: «setting:dnd_classic» / «setting:warcraft»
+# (укладывается в лимит Telegram в 64 байта).
+SETTING_CALLBACK_PREFIX = "setting:"
+
+# Человекочитаемые названия миров — для листа персонажа, подсказок и всплывающих сообщений.
+SETTING_LABELS: dict[str, str] = {
+    SETTING_DND_CLASSIC: "🎲 Классический D&D 2024 (Забытые Королевства)",
+    SETTING_WARCRAFT: "⚔️ Вселенная Warcraft (Азерот, 20–27 гг. ADP)",
+}
+
+# Хроника мира Warcraft: текстовый файл в корне проекта (копия «вов.txt»),
+# из которого собирается блок лора для системного промпта Мастера.
+WARCRAFT_LORE_PATH = BASE_DIR / "warcraft_lore.txt"
+# Запасной источник: исходная хроника «вов.txt» (если основной файл потерялся).
+WARCRAFT_LORE_FALLBACK_PATH = BASE_DIR / "вов.txt"
+# Предохранитель: лор не должен бесконечно раздувать системный промпт (и счёт за токены).
+# Хроника занимает ~28 тыс. символов (примерно 10–12 тыс. токенов); если запросы начнут
+# упираться в контекст модели, уменьшите значение — хроника обрежется по границе строки.
+WARCRAFT_LORE_MAX_CHARS = 60000
+
+
+def normalize_setting(value: Any) -> str:
+    """Приводит значение сеттинга к допустимому (при «мусоре» — классический D&D)."""
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in SETTING_CHOICES:
+            return cleaned
+    return SETTING_DND_CLASSIC
+
+
+def _load_knowledge_text(
+    paths: Iterable[Path],
+    limit: int = WARCRAFT_LORE_MAX_CHARS,
+) -> str:
+    """Безопасно читает текстовую базу знаний (пустая строка, если файла нет).
+
+    Файл читается один раз при запуске бота: ошибки чтения и повреждённая
+    кодировка логируются и не роняют запуск, а слишком длинный текст обрезается
+    по границе строки — чтобы контекст модели не переполнился.
+    """
+    for path in paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8").strip()
+        except OSError as error:
+            logger.warning("Не удалось прочитать файл базы знаний %s: %s", path, error)
+            continue
+        if not text:
+            continue
+        if len(text) > limit:
+            logger.warning(
+                "Файл %s слишком длинный (%d символов) — обрезаю до %d символов.",
+                path,
+                len(text),
+                limit,
+            )
+            text = text[:limit].rsplit("\n", 1)[0] + "\n[...хроника сокращена...]"
+        return text
+    return ""
+
+
+# Хроника Азерота для подмешивания в системный промпт (загружается при старте бота).
+WARCRAFT_LORE_PROMPT = _load_knowledge_text(
+    (WARCRAFT_LORE_PATH, WARCRAFT_LORE_FALLBACK_PATH)
+)
+if WARCRAFT_LORE_PROMPT:
+    logger.info(
+        "Хроника Warcraft загружена: %d символов (%s).",
+        len(WARCRAFT_LORE_PROMPT),
+        WARCRAFT_LORE_PATH.name,
+    )
+else:
+    logger.warning(
+        "Хроника Warcraft не найдена (%s) — сеттинг Warcraft будет работать "
+        "без подробного лора из файла.",
+        WARCRAFT_LORE_PATH,
+    )
+
+# ---------------------------------------------------------------------------
+# 2.2 ОГРАНИЧЕНИЕ ДОСТУПА И ЧАСТОТЫ (белый список и антифлуд)
 # ---------------------------------------------------------------------------
 
 
@@ -379,6 +498,24 @@ BASE_DM_PROMPT = """
 - Никогда не забывай про Приёмы оружия: каждый раз при попадании сверяйся со свойством Mastery
   оружия из листа персонажа.
 
+# МАГИЯ, ЗАКЛИНАНИЯ И ЯЧЕЙКИ (ОБЯЗАТЕЛЬНО)
+- Ячейки заклинаний, заговоры, лимит подготовки и восстановление на отдыхе считает КОД бота, а не
+  ты. Ты никогда не списываешь и не выдумываешь ячейки, не меняешь круги заклинаний и не «забываешь»
+  ячейки по своему желанию.
+- Игрок применяет заклинание кнопкой «🔥 Применить заклинание» в разделе «📜 Заклинания» или командой
+  /spells. Тогда система присылает тебе сообщение [СИСТЕМА] с названием заклинания, его кругом и
+  остатком ячеек — опиши эффект заклинания по правилам и учти, что ячейка уже потрачена.
+- Заговоры (0 круг) ячеек не тратят: их можно применять сколько угодно.
+- Заклинания ограничены справочником правил ниже: если игрок объявляет заклинание, которого нет ни в
+  справочнике, ни в его заговорах/готовых заклинаниях — вежливо откажи и предложи законную альтернативу.
+- Подготовка: у Волшебника, Жреца, Друида, Паладина и Следопыта готовить на день можно не больше
+  «уровень класса + модификатор характеристики магии» заклинаний (кнопка «⚡ Подготовка»). У Барда,
+  Чародея и Колдуна лимита нет: всё изученное всегда готово к применению.
+- Отдых восстанавливает ячейки ТОЛЬКО кодом (кнопка «🌙 Отдых» или команда /rest): продолжительный
+  отдых (8 часов) возвращает все ячейки, короткий (1 час) — лишь магию пакта Колдуна. Если игрок
+  просто пишет «отдыхаю», предложи нажать кнопку «🌙 Отдых» и НЕ восстанавливай ячейки сам.
+- Урон и лечение заклинаний передавай как обычно — через "hp_change" в служебном JSON-блоке.
+
 # ФАЗА БОЯ: ДЕТАЛИ БОЕВОГО ЦИКЛА (Combat Turn Loop) — ОБЯЗАТЕЛЬНО К ИСПОЛНЕНИЮ
 - Бой ведётся строгим циклом ходов (см. «ПРАВИЛО ПОШАГОВОСТИ БОЯ» выше). Когда игрок объявляет
   атаку, ты не имеешь права описать её одним абзацем и оставить врага без ответа — ты обязан
@@ -483,6 +620,75 @@ CONTROL_BLOCK_INSTRUCTIONS = """
 # Полный системный промпт: стиль Мастера + официальный справочник правил + служебный блок.
 SYSTEM_PROMPT = "\n\n".join((BASE_DM_PROMPT, build_reference_digest(), CONTROL_BLOCK_INSTRUCTIONS))
 
+# Шапка блока сеттинга Warcraft: правила боёвки остаются «данжоновскими», а мир — азеротский.
+WARCRAFT_SETTING_INTRO = """
+=== ТЕКУЩИЙ СЕТТИНГ: ВСЕЛЕННАЯ WARCRAFT (АЗЕРОТ) ===
+Ты ведёшь D&D-партию в мире Warcraft.
+Используй правила бросков и боёвки D&D, но мир, локации, персонажи, имена, монстры и фракции
+берутся СТРОГО из лора Warcraft.
+СТРОГИЕ ХРОНИЧЕСКИЕ И СИСТЕМНЫЕ ПРАВИЛА:
+""".strip()
+
+# Подвал блока: как Мастеру играть в этом мире (хронология, виды героя, фракции).
+WARCRAFT_SETTING_OUTRO = """
+# КАК ВЕСТИ ПАРТИЮ В ЭТОМ СЕТТИНГЕ (ОБЯЗАТЕЛЬНО)
+- Действие идёт строго между 20 и 27 годами ADP (эпоха Третьей Войны). Всё, что позже
+  (Катаклизм, пандарены, альтернативный Дренор, возвращение Пылающего Легиона, сожжение
+  Тельдрассила, Темные Земли), ещё НЕ произошло: NPC об этом не знают.
+  Любое знание о будущем считай критической ошибкой.
+- Локации, столицы, фракции, NPC и монстры бери ТОЛЬКО из хроники выше. Не выдумывай
+  события, героев и места вне неё.
+- Лист персонажа, броски, КД, урон и заклинания считаются по правилам D&D 2024.
+  Класс героя — один из 12 классов PHB 2024 (Воин, Варвар, Плут, Волшебник, Жрец,
+  Следопыт, Паладин, Бард, Друид, Колдун, Монах, Чародей).
+- Вид (расу) героя игрок называет из народов Азерота: человек Штормграда или Терамора,
+  дворф Стальгорна, гном Гномрегана, ночной эльф, орк, таурен, тролль Чёрного Копья,
+  отрекшийся, эльф крови, дреней. Записывай её в поле "race" как есть.
+- Фракции враждуют и дружат строго по хронике: Альянс, Орда, Плеть, Культ Проклятых,
+  Кирин-Тор, Серебряный Рассвет, Круг Кенария. Плеть и её рыцари смерти — главная угроза.
+- Речь, титулы и имена NPC — в духе Warcraft; игрок может воевать за любую фракцию,
+  но её союзники и враги определяются хроникой.
+- Если игрок спрашивает о событиях вне хроники (после 27 года ADP или из другого мира) —
+  отвечай как Мастер: таких сведений в мире ещё нет.
+""".strip()
+
+# Текст-заглушка, если файл хроники не найден: Мастер не выдумывает мир, но играет дальше.
+WARCRAFT_LORE_MISSING_NOTE = (
+    "Файл хроники не загружен — опирайся на общие знания о Warcraft эпохи Третьей Войны "
+    "(20–27 гг. ADP) и строго соблюдай хронологию."
+)
+
+
+@lru_cache(maxsize=4)
+def build_system_prompt(setting: str = SETTING_DND_CLASSIC) -> str:
+    """Собирает системный промпт Мастера под выбранный сеттинг.
+
+    * "dnd_classic" — базовый промпт: стиль Мастера + справочник правил + служебный блок;
+    * "warcraft"    — тот же промпт, но с блоком сеттинга, полной хроникой Азерота
+      (WARCRAFT_LORE_PROMPT) и правилами игры в этом мире.
+
+    Функция кэшируется (lru_cache): большой текст хроники подмешивается один раз
+    на сеттинг, а не пересобирается на каждый запрос к модели.
+    """
+    if normalize_setting(setting) != SETTING_WARCRAFT:
+        return SYSTEM_PROMPT
+
+    lore = WARCRAFT_LORE_PROMPT or WARCRAFT_LORE_MISSING_NOTE
+    return "\n\n".join(
+        (
+            BASE_DM_PROMPT,
+            f"{WARCRAFT_SETTING_INTRO}\n{lore}",
+            WARCRAFT_SETTING_OUTRO,
+            build_reference_digest(),
+            CONTROL_BLOCK_INSTRUCTIONS,
+        )
+    )
+
+
+def setting_label(setting: str) -> str:
+    """Человекочитаемое название сеттинга (для листа персонажа и сообщений игроку)."""
+    return SETTING_LABELS[normalize_setting(setting)]
+
 # ---------------------------------------------------------------------------
 # 4. СТАТИЧНЫЕ ТЕКСТЫ И СЛУЖЕБНЫЕ СООБЩЕНИЯ
 # ---------------------------------------------------------------------------
@@ -491,12 +697,19 @@ WELCOME_TEXT = (
     "🐉 Добро пожаловать за стол, искатель приключений!\n\n"
     "Я — твой Мастер Подземелий в духе Dungeons & Dragons 5e (2024). Я опишу мир, его "
     "опасности и судьбу твоего героя, но все решения остаются за тобой.\n\n"
+    "Шаг 0 — выбери мир игры кнопками ниже:\n"
+    "• 🎲 Забытые Королевства — классический D&D 2024.\n"
+    "• ⚔️ Вселенная Warcraft (Азерот, 20–27 гг. ADP) — правила D&D 2024, но мир, фракции, "
+    "города, монстры и NPC строго из хроники Warcraft.\n\n"
     "Шаг 1 — создай героя:\n"
     "• Назови имя, вид (раса), класс и пару слов о внешности или характере героя.\n"
     "• Виды по правилам PHB 2024: Человек, Эльф, Дварф, Гном, Полурослик, Драконорождённый, "
     "Тифлинг, Орк, Голиаф, Аасимар.\n"
     "• Классы: Воин, Варвар, Плут, Волшебник, Жрец, Следопыт, Паладин, Бард, Друид, Колдун, "
     "Монах, Чародей.\n"
+    "• В сеттинге Warcraft вид героя — из народов Азерота (человек Штормграда или Терамора, "
+    "дворф, гном, ночной эльф, орк, таурен, тролль, эльф крови, отрекшийся, дреней), а классы "
+    "те же 12 из PHB 2024.\n"
     "• Не хочешь придумывать сам — напиши «Случайный герой» или нажми кнопку "
     "«🎲 Случайный герой»: я соберу героя 1-го уровня строго по правилам PHB 2024 "
     "(характеристики, HP и стартовое снаряжение считает код бота).\n"
@@ -509,7 +722,9 @@ WELCOME_TEXT = (
     "• Проверки характеристик с модификатором — кнопка 🧠 Проверки по статам или команда /check.\n"
     "• Играй по правилам Книги Игрока 2024 — я не приму накрученные броски и урон не по правилам.\n"
     "• Веди лист персонажа: кнопки «📜 Лист» и «🎒 Инвентарь», команды /sheet и /inventory.\n"
-    "Команды: /start, /reset, /hero, /roll <кубик>, /sheet, /inventory, /check.\n\n"
+    "• Играешь заклинателем — открывай раздел «📜 Заклинания» (/spells): там ячейки, применение\n"
+    "  заклинаний, подготовка на день и отдых «🌙 Отдых» (/rest) для восстановления ячеек.\n"
+    "Команды: /start, /reset, /hero, /roll <кубик>, /sheet, /inventory, /check, /spells, /rest.\n\n"
     "Предыдущая сессия сброшена. Сперва — герой, потом — приключение!"
 )
 
@@ -549,6 +764,16 @@ HERO_CREATION_PROMPT = (
     "подтвердить героя."
 )
 
+# Дополнение к инструкции создания героя для сеттинга Warcraft: раса — из Азерота, класс — из PHB 2024.
+WARCRAFT_CREATION_ADDENDUM = (
+    "[СЕТТИНГ WARCRAFT] Мир игры — Азерот (20–27 гг. ADP). Вид (расу) героя предлагай из народов "
+    "Азерота (человек Штормграда или Терамора, дворф Стальгорна, гном Гномрегана, ночной эльф, "
+    "орк, таурен, тролль Чёрного Копья, отрекшийся, эльф крови, дреней…), а класс — из 12 классов "
+    "PHB 2024 (Воин, Варвар, Плут, Волшебник, Жрец, Следопыт, Паладин, Бард, Друид, Колдун, Монах, "
+    "Чародей). В поле \"race\" записывай расу Азерота как есть, в поле \"class_name\" — класс D&D. "
+    "Мир, локации и NPC — строго по хронике Warcraft из системного промпта."
+)
+
 # Тексты, которые бот показывает игроку после создания героя.
 HERO_CARD_TITLE_CREATED = "✅ Герой записан в лист персонажа!"
 HERO_CARD_TITLE_RANDOM = "🎲 Случайный герой готов!"
@@ -562,6 +787,33 @@ HERO_CARD_QUESTION = (
 HERO_NOT_CREATED_ALERT = (
     "Сначала закончим героя: нужны имя, вид (раса) и класс.\n"
     "Опиши их в сообщении или нажми «🎲 Случайный герой»."
+)
+
+# --- Выбор сеттинга (мира игры) на этапе создания персонажа ---
+
+SETTING_MENU_TEXT = (
+    "🌍 ШАГ 0: ВЫБОР МИРА ИГРЫ\n"
+    "🎲 Забытые Королевства — классический D&D 2024: официальные виды и классы PHB.\n"
+    "⚔️ Вселенная Warcraft — Азерот эпохи Третьей Войны (20–27 гг. ADP): правила D&D 2024, "
+    "но мир, фракции, города, монстры и NPC строго из хроники Warcraft.\n\n"
+    "Нажми кнопку ниже, чтобы выбрать мир, а затем опиши героя. Сменить мир можно только "
+    "при создании нового героя (/reset)."
+)
+
+SETTING_CONFIRM_DND = "🎲 Сеттинг установлен: Классический D&D 2024. Опишите вашего героя:"
+
+SETTING_CONFIRM_WARCRAFT = (
+    "⚔️ Сеттинг установлен: Вселенная Warcraft (20–27 гг. ADP). "
+    "Выберите или опишите вашего героя (раса, класс, предыстория):"
+)
+
+# Подсказка игроку, начавшему создание героя кнопкой/командой «🎲 Случайный герой».
+HERO_SETTING_FIRST_NOTE = "Сначала выбери мир игры — и я соберу случайного героя."
+
+# Сеттинг переключён уже по ходу приключения (кнопка из старого сообщения).
+SETTING_SWITCHED_TEXT = (
+    "🌍 Мир игры переключён: {label}.\n"
+    "Мастер учтёт новый сеттинг со следующей сцены — продолжай приключение."
 )
 
 HERO_ALREADY_CONFIRMED_ALERT = "Герой уже подтверждён — приключение идёт. Что ты делаешь?"
@@ -628,6 +880,56 @@ STALE_CALLBACK_TEXT = (
 )
 
 UNKNOWN_BUTTON_TEXT = "Неизвестная кнопка — попробуй ещё раз."
+
+# Тексты раздела магии (карточка заклинаний, применение, подготовка и отдых).
+SPELLS_MENU_TEXT = (
+    "🪄 КНИГА ЗАКЛИНАНИЙ\n"
+    "Применяй заклинания, готовь их на день или отдыхай, чтобы восстановить ячейки."
+)
+
+NOT_SPELLCASTER_TEXT = (
+    "🪄 У этого героя нет магии: его класс не владеет заклинаниями.\n"
+    "Магией пользуются Бард, Жрец, Друид, Паладин, Следопыт, Чародей, Колдун и Волшебник."
+)
+
+SPELL_MENU_STALE_TEXT = (
+    "Меню заклинаний устарело. Открой его заново кнопкой «📜 Заклинания»."
+)
+
+SPELL_NOT_AVAILABLE_ALERT = (
+    "Это заклинание сейчас недоступно: его нет в списке заговоров или оно не "
+    "заготовлено на сегодня."
+)
+
+CAST_MENU_TEXT = (
+    "🔥 ЧТО ПРИМЕНИТЬ\n"
+    "Нажми заклинание — код спишет ячейку нужного круга и передаст применение Мастеру. "
+    "Заговоры ячеек не тратят."
+)
+
+PREP_MENU_TEXT = (
+    "⚡ ПОДГОТОВКА ЗАКЛИНАНИЙ\n"
+    "Нажми заклинание, чтобы заготовить или снять его: ✅ — готово к применению, "
+    "❌ — не заготовлено."
+)
+
+SPONTANEOUS_PREP_ALERT = (
+    "Твой класс — спонтанный заклинатель: все изученные заклинания всегда готовы к "
+    "применению, менять список подготовки не нужно."
+)
+
+REST_MENU_TEXT = (
+    "🌙 ОТДЫХ\n"
+    "Продолжительный отдых (8 часов) восстанавливает ВСЕ ячейки заклинаний.\n"
+    "Короткий отдых (1 час) восстанавливает «магию пакта» Колдуна."
+)
+
+NO_SLOTS_ALERT = "У этого героя нет ячеек заклинаний."
+
+REST_NOT_CASTERTEXT = (
+    "У этого героя нет магии, поэтому ячейки заклинаний восстанавливать нечего.\n"
+    "Отдохнуть всё равно можно — просто опиши отдых словами."
+)
 
 # Короткая инструкция для Мастера после любого броска, сделанного кодом бота.
 DM_ROLL_INSTRUCTION = (
@@ -854,6 +1156,19 @@ def _as_text_list(value: Any) -> list[str]:
     return items
 
 
+def _unique_spell_list(value: Any) -> list[str]:
+    """Приводит значение к списку названий заклинаний без пустых строк и дублей."""
+    items: list[str] = []
+    seen: set[str] = set()
+    for candidate in _as_text_list(value):
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(candidate)
+    return items
+
+
 def _remove_first(items: list[str], target: str) -> bool:
     """Удаляет первое совпадение по названию (без учёта регистра). True при успехе."""
     needle = target.strip().lower()
@@ -913,6 +1228,24 @@ class Character:
     # Обновляется служебным JSON-блоком Мастера при смене обстановки (см. apply_control).
     location: str = DEFAULT_LOCATION
     quest: str = DEFAULT_QUEST
+    # Сеттинг партии: "dnd_classic" (Забытые Королевства) или "warcraft" (Азерот).
+    # Выбирается игроком в начале создания персонажа (кнопки SETTINGS_KEYBOARD),
+    # хранится в базе и определяет, подмешивать ли в промпт Мастера хронику Warcraft.
+    setting: str = SETTING_DND_CLASSIC
+    # --- Магия (spellcasting) ---
+    # Поля магии заполняются автоматически по классу и уровню (см. _normalize_spellcasting),
+    # поэтому у записей прежних версий они просто инициализируются значениями по умолчанию.
+    is_spellcaster: bool = False
+    # Код характеристики магии класса: 'int', 'wis' или 'cha' (пусто у не-заклинателей).
+    spellcasting_ability: str = ""
+    # Ячейки заклинаний: {'1': {'total': 4, 'current': 2}, ...} — круг -> ячейки.
+    spell_slots: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Заговоры (0 круг) — ячеек не тратят и в лимит заготовки не входят.
+    cantrips: list[str] = field(default_factory=list)
+    # Все изученные заклинания 1+ круга.
+    spells_known: list[str] = field(default_factory=list)
+    # Заготовленные на сегодня заклинания (у спонтанных кастеров = spells_known).
+    spells_prepared: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Нормализует «сырые» данные: обрезает строки и приводит числа к правилам."""
@@ -942,6 +1275,83 @@ class Character:
         # Сводка локации и цели всегда непустая: пустая строка означает «не задано».
         self.location = (self.location or "").strip()[:120] or DEFAULT_LOCATION
         self.quest = (self.quest or "").strip()[:120] or DEFAULT_QUEST
+        # Сеттинг: любое неизвестное значение трактуем как классический D&D.
+        self.setting = normalize_setting(self.setting)
+        # Магия: ячейки, заговоры и заклинания приводим к правилам класса и уровня.
+        self._normalize_spellcasting()
+
+    def _normalize_spellcasting(self) -> None:
+        """Инициализирует поля магии по классу и уровню (безопасно для записей прежних версий).
+
+        Если у класса есть магия, а списков ещё нет (герой создан до появления системы
+        заклинаний), они заполняются классовыми заговорами и стартовыми заклинаниями
+        1-го уровня. Текущий остаток ячеек из базы бережно сохраняется.
+        """
+        ability = spellcasting_ability_for_class(self.class_name)
+        if ability is None:
+            self.is_spellcaster = False
+            self.spellcasting_ability = ""
+            self.spell_slots = {}
+            self.cantrips = []
+            self.spells_known = []
+            self.spells_prepared = []
+            return
+
+        self.is_spellcaster = True
+        self.spellcasting_ability = ability
+
+        # Количество ячеек берём из таблиц правил, остаток (current) — из базы, если он есть.
+        totals = spell_slots_for_level(self.class_name, self.level)
+        raw_slots = self.spell_slots if isinstance(self.spell_slots, Mapping) else {}
+        normalized_slots: dict[str, dict[str, int]] = {}
+        for circle, total in totals.items():
+            stored = raw_slots.get(circle)
+            current = total
+            if isinstance(stored, Mapping):
+                current = max(0, min(_as_int(stored.get("current", total)), total))
+            normalized_slots[circle] = {"total": total, "current": current}
+        self.spell_slots = normalized_slots
+
+        self.cantrips = _unique_spell_list(self.cantrips)
+        self.spells_known = _unique_spell_list(self.spells_known)
+        self.spells_prepared = _unique_spell_list(self.spells_prepared)
+
+        # Заговоры и заклинания 1+ круга — непересекающиеся списки.
+        cantrip_set = set(self.cantrips)
+        self.spells_known = [name for name in self.spells_known if name not in cantrip_set]
+        self.spells_prepared = [name for name in self.spells_prepared if name not in cantrip_set]
+
+        if not self.cantrips:
+            self.cantrips = list(default_cantrips_for_class(self.class_name))
+        if not self.spells_known:
+            self.spells_known = list(default_known_spells_for_class(self.class_name))
+
+        if is_spontaneous_caster(self.class_name):
+            # Спонтанные заклинатели всегда держат готовыми всё изученное.
+            self.spells_prepared = list(self.spells_known)
+            return
+
+        # Подготовленными могут быть только изученные заклинания, но не больше лимита.
+        prepared = [name for name in self.spells_prepared if name in self.spells_known]
+        limit = self.max_prepared
+        if not prepared:
+            prepared = list(self.spells_known[:limit])
+        self.spells_prepared = prepared[:limit]
+
+    def init_default_spellcasting(self) -> None:
+        """Заполняет магию «по умолчанию» для нового героя (класс и характеристики заданы).
+
+        Вызывается кодом при создании персонажа (см. apply_starter_loadout), когда
+        характеристики уже выставлены по стандартному набору и лимит подготовки известен.
+        """
+        if not self.is_spellcaster:
+            return
+        self.cantrips = list(default_cantrips_for_class(self.class_name))
+        self.spells_known = list(default_known_spells_for_class(self.class_name))
+        if is_spontaneous_caster(self.class_name):
+            self.spells_prepared = list(self.spells_known)
+        else:
+            self.spells_prepared = list(self.spells_known[: self.max_prepared])
 
     # --- Проверки состояния персонажа ---
 
@@ -1032,6 +1442,142 @@ class Character:
         """Жив ли персонаж (HP выше нуля)."""
         return self.current_hp > 0
 
+    # --- Магия: производные величины и операции с ячейками ---
+
+    @property
+    def spell_save_dc(self) -> int:
+        """КС спасброска от заклинаний: 8 + бонус мастерства + модификатор характеристики."""
+        if not self.is_spellcaster:
+            return 0
+        return 8 + self.proficiency_bonus + self.ability_mod(self.spellcasting_ability)
+
+    @property
+    def spell_attack_bonus(self) -> int:
+        """Модификатор атаки заклинанием: бонус мастерства + модификатор характеристики."""
+        if not self.is_spellcaster:
+            return 0
+        return self.proficiency_bonus + self.ability_mod(self.spellcasting_ability)
+
+    @property
+    def max_prepared(self) -> int:
+        """Лимит заготовленных заклинаний (уровень + модификатор характеристики, мин. 1).
+
+        Для спонтанных заклинателей лимита нет — возвращается число изученных заклинаний.
+        Для класса без магии возвращается 0.
+        """
+        if not self.is_spellcaster:
+            return 0
+        limit = max_prepared_spells(
+            self.class_name, self.level, self.ability_mod(self.spellcasting_ability or "int")
+        )
+        if limit is None:
+            return len(self.spells_known)
+        return max(1, limit)
+
+    @property
+    def total_slots(self) -> int:
+        """Суммарное число ячеек заклинаний всех кругов."""
+        return sum(slot["total"] for slot in self.spell_slots.values())
+
+    @property
+    def available_slots(self) -> int:
+        """Сколько ячеек заклинаний сейчас свободно."""
+        return sum(slot["current"] for slot in self.spell_slots.values())
+
+    def spell_circle(self, spell_name: str) -> int:
+        """Круг заклинания: 0 — заговор, иначе круг из справочника (по умолчанию 1)."""
+        if spell_name in self.cantrips:
+            return 0
+        level = spell_level(spell_name)
+        return 1 if level is None else level
+
+    def castable_spells(self) -> list[tuple[str, int]]:
+        """Доступные к применению заклинания: (название, круг); заговоры идут первыми."""
+        entries: list[tuple[str, int]] = [(name, 0) for name in self.cantrips]
+        entries += [(name, self.spell_circle(name)) for name in self.spells_prepared]
+        return entries
+
+    def can_prepare_more(self) -> bool:
+        """Есть ли ещё место в лимите подготовки заклинаний."""
+        return len(self.spells_prepared) < self.max_prepared
+
+    def toggle_prepared(self, spell_name: str) -> bool:
+        """Переключает заготовку заклинания. True — заготовлено, False — снято."""
+        if spell_name in self.spells_prepared:
+            self.spells_prepared = [name for name in self.spells_prepared if name != spell_name]
+            return False
+        self.spells_prepared.append(spell_name)
+        return True
+
+    def cast_spell(self, spell_name: str) -> "SpellCastResult":
+        """Списывает ячейку круга при применении заклинания (заговоры ячеек не тратят).
+
+        Применить можно только заговор или заготовленное заклинание: неизученные и
+        снятые с подготовки заклинания отклоняются с подсказкой.
+
+        :return: результат с заметкой игроку и служебным сообщением для Мастера; при
+            нехватке ячеек или недоступном круге ``ok=False`` и заполнено ``alert``.
+        """
+        if spell_name not in self.cantrips and spell_name not in self.spells_prepared:
+            return SpellCastResult(ok=False, alert=SPELL_NOT_AVAILABLE_ALERT)
+
+        circle = self.spell_circle(spell_name)
+        circle_label = SPELL_LEVEL_RU.get(circle, f"{circle} круг")
+
+        if circle == 0:
+            return SpellCastResult(
+                ok=True,
+                note=f"🪄 Ты применяешь заговор «{spell_name}» (ячейки не тратятся).",
+                context=(
+                    f"[СИСТЕМА] Игрок применяет заклинание '{spell_name}' "
+                    f"(заговор, ячейки не требуются)."
+                ),
+            )
+
+        slot = self.spell_slots.get(str(circle))
+        if not slot or slot["total"] <= 0:
+            return SpellCastResult(
+                ok=False,
+                alert=f"Заклинания {circle_label} тебе пока недоступны.",
+            )
+        if slot["current"] <= 0:
+            return SpellCastResult(
+                ok=False,
+                alert=f"🔒 Нет свободных ячеек {circle_label}! Отдохни, чтобы восстановить их.",
+            )
+
+        slot["current"] -= 1
+        left, total = slot["current"], slot["total"]
+        return SpellCastResult(
+            ok=True,
+            note=(
+                f"🪄 Ты применяешь «{spell_name}» ({circle_label}). "
+                f"Осталось ячеек {circle_label}: {left}/{total}."
+            ),
+            context=(
+                f"[СИСТЕМА] Игрок применяет заклинание '{spell_name}' ({circle_label}). "
+                f"Осталось ячеек {circle_label}: {left}/{total}."
+            ),
+        )
+
+    def restore_spell_slots(self, long_rest: bool) -> list[str]:
+        """Восстанавливает ячейки при отдыхе. Возвращает заметки для игрока.
+
+        Продолжительный (длинный) отдых возвращает все ячейки; короткий — только «магию
+        пакта» Колдуна (у остальных классов на коротком отдыхе ячейки не восстанавливаются).
+        """
+        if not self.spell_slots:
+            return []
+        if not (long_rest or is_pact_caster(self.class_name)):
+            return []
+
+        notes: list[str] = []
+        for circle, slot in self.spell_slots.items():
+            slot["current"] = slot["total"]
+            label = SPELL_LEVEL_RU.get(_as_int(circle), f"{circle} круг")
+            notes.append(f"🔋 {label}: {slot['current']}/{slot['total']}.")
+        return notes
+
     # --- Изменение листа персонажа ---
 
     def _level_up(self) -> str:
@@ -1040,6 +1586,8 @@ class Character:
         gained = average_hit_points(self.hit_die, self.ability_mod("con"))
         self.max_hp += gained
         self.current_hp = min(self.max_hp, self.current_hp + gained)
+        # Новый уровень открывает новые ячейки заклинаний (текущий остаток сохраняется).
+        self._normalize_spellcasting()
         return (
             f"⬆️ НОВЫЙ УРОВЕНЬ: {self.level}! Максимум HP: {self.max_hp} (+{gained}). "
             f"Бонус мастерства: {format_modifier(self.proficiency_bonus)}."
@@ -1075,6 +1623,12 @@ class Character:
             if cleaned != self.class_name:
                 self.class_name = cleaned
                 notes.append(f"⚔️ Класс: {self.class_name} (кость хитов d{self.hit_die}).")
+                # Смена класса полностью пересобирает магию: списки заклинаний и ячейки.
+                self.cantrips = []
+                self.spells_known = []
+                self.spells_prepared = []
+                self.spell_slots = {}
+                self._normalize_spellcasting()
 
         description = data.get("description")
         if isinstance(description, str) and description.strip():
@@ -1103,6 +1657,8 @@ class Character:
         if 1 <= level <= MAX_LEVEL and level != self.level:
             self.level = level
             notes.append(f"🎖️ Уровень: {self.level}.")
+            # Уровень определяет число ячеек заклинаний — пересчитываем их.
+            self._normalize_spellcasting()
 
         abilities = data.get("abilities")
         if isinstance(abilities, dict):
@@ -1117,6 +1673,10 @@ class Character:
                     changed.append(f"{ABILITIES[code]} {value}")
             if changed:
                 notes.append("🧠 Характеристики: " + ", ".join(changed) + ".")
+                # Модификатор характеристики магии задаёт лимит подготовки — подрезаем список,
+                # если характеристику понизили через служебный блок.
+                if self.is_spellcaster and not is_spontaneous_caster(self.class_name):
+                    self.spells_prepared = self.spells_prepared[: self.max_prepared]
 
         max_hp = _as_int(data.get("max_hp"))
         if max_hp > 0:
@@ -1198,6 +1758,16 @@ class Character:
             "hero_confirmed": bool(self.hero_confirmed),
             "location": self.location,
             "quest": self.quest,
+            "setting": normalize_setting(self.setting),
+            "is_spellcaster": bool(self.is_spellcaster),
+            "spellcasting_ability": self.spellcasting_ability,
+            "spell_slots": {
+                str(circle): {"total": int(slot["total"]), "current": int(slot["current"])}
+                for circle, slot in self.spell_slots.items()
+            },
+            "cantrips": list(self.cantrips),
+            "spells_known": list(self.spells_known),
+            "spells_prepared": list(self.spells_prepared),
         }
 
     def to_json(self) -> str:
@@ -1244,6 +1814,18 @@ class Character:
                 name != DEFAULT_NAME and race != DEFAULT_RACE and class_name != DEFAULT_CLASS
             )
 
+        raw_slots = data.get("spell_slots")
+        spell_slots: dict[str, dict[str, int]] = {}
+        if isinstance(raw_slots, Mapping):
+            for raw_circle, raw_slot in raw_slots.items():
+                circle = str(raw_circle).strip()
+                if not circle or not isinstance(raw_slot, Mapping):
+                    continue
+                spell_slots[circle] = {
+                    "total": _as_int(raw_slot.get("total")),
+                    "current": _as_int(raw_slot.get("current")),
+                }
+
         return cls(
             name=name,
             race=race,
@@ -1260,6 +1842,13 @@ class Character:
             hero_confirmed=hero_confirmed,
             location=_as_optional_label(data.get("location")) or DEFAULT_LOCATION,
             quest=_as_optional_label(data.get("quest")) or DEFAULT_QUEST,
+            setting=normalize_setting(data.get("setting")),
+            is_spellcaster=bool(data.get("is_spellcaster")),
+            spellcasting_ability=_as_optional_text(data.get("spellcasting_ability")) or "",
+            spell_slots=spell_slots,
+            cantrips=_unique_spell_list(data.get("cantrips")),
+            spells_known=_unique_spell_list(data.get("spells_known")),
+            spells_prepared=_unique_spell_list(data.get("spells_prepared")),
         )
 
     @classmethod
@@ -1275,6 +1864,22 @@ class Character:
             logger.warning("Повреждённая запись листа персонажа в базе — создаю нового героя.")
             return cls()
         return cls.from_dict(data)
+
+
+@dataclass
+class SpellCastResult:
+    """Результат применения заклинания кодом бота (см. Character.cast_spell).
+
+    :param ok: успешно ли применение (ячейка списана или это заговор).
+    :param note: текст-подтверждение для игрока (при успехе).
+    :param context: служебное сообщение Мастеру об использованном заклинании.
+    :param alert: всплывающая подсказка кнопки при отказе (не хватает ячеек и т.п.).
+    """
+
+    ok: bool
+    note: str = ""
+    context: str = ""
+    alert: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1328,6 +1933,22 @@ def format_character_sheet(character: Character) -> str:
         [f"🖋️ Описание: {character.description}"] if character.description else []
     )
 
+    # Магический блок в листе показываем только заклинателям.
+    magic_lines: list[str] = []
+    if character.is_spellcaster:
+        ability = ABILITY_FULL_RU.get(
+            character.spellcasting_ability, character.spellcasting_ability.upper()
+        )
+        magic_lines = [
+            "",
+            f"🪄 Магия класса ({ability}): КС спасброска {character.spell_save_dc}, "
+            f"атака заклинанием {format_modifier(character.spell_attack_bonus)}",
+            *format_slots_tracker(character.spell_slots),
+            f"🌟 Заговоры: {', '.join(character.cantrips) or 'нет'}",
+            f"📚 Готово ({len(character.spells_prepared)}/{character.max_prepared}): "
+            f"{', '.join(character.spells_prepared) or 'нет'}",
+        ]
+
     return "\n".join(
         [
             "📜 ЛИСТ ПЕРСОНАЖА",
@@ -1337,6 +1958,7 @@ def format_character_sheet(character: Character) -> str:
             f"📛 Имя: {character.name}",
             f"🧬 Раса: {character.race}",
             f"⚔️ Класс: {character.class_name} (кость хитов d{character.hit_die})",
+            f"🌍 Мир: {setting_label(character.setting)}",
             *description_lines,
             f"🎖️ Уровень: {character.level} "
             f"(бонус мастерства {format_modifier(character.proficiency_bonus)})",
@@ -1353,6 +1975,7 @@ def format_character_sheet(character: Character) -> str:
             "",
             "🧠 Характеристики",
             *ability_rows,
+            *magic_lines,
             "",
             inventory_title,
             inventory,
@@ -1379,6 +2002,154 @@ def format_inventory(character: Character) -> str:
             f"{character.current_hp}/{character.max_hp}",
         ]
     )
+
+
+def _spell_circle_label(circle: int) -> str:
+    """Русское название круга заклинания для карточек и кнопок."""
+    return SPELL_LEVEL_RU.get(circle, f"{circle} круг")
+
+
+def _spell_circle_locked(character: Character, circle: int) -> bool:
+    """Закончились ли ячейки нужного круга (заговоры не «запираются» никогда)."""
+    if circle <= 0:
+        return False
+    slot = character.spell_slots.get(str(circle))
+    return slot is None or slot["current"] <= 0
+
+
+def format_slots_tracker(spell_slots: Mapping[str, Mapping[str, int]]) -> list[str]:
+    """Строки трекера ячеек заклинаний: «🔋 1 круг: [████░░░░] 2/4»."""
+    if not spell_slots:
+        return ["🔋 Ячейки: нет — заговоры ячеек не тратят."]
+    lines: list[str] = []
+    for circle in sorted(spell_slots, key=int):
+        slot = spell_slots[circle]
+        total = int(slot.get("total", 0))
+        current = int(slot.get("current", 0))
+        bar = hp_progress_bar(current, total, width=12)
+        lines.append(f"🔋 {_spell_circle_label(int(circle))}: [{bar}] {current}/{total}")
+    return lines
+
+
+def format_spells_card(character: Character) -> str:
+    """Карточка «📜 Книга заклинаний»: характеристика, КС, ячейки и заговоры."""
+    if not character.is_spellcaster:
+        return NOT_SPELLCASTER_TEXT
+
+    ability = ABILITY_FULL_RU.get(
+        character.spellcasting_ability, character.spellcasting_ability.upper()
+    )
+    lines = [
+        SPELLS_MENU_TEXT,
+        "",
+        format_hud(character),
+        "",
+        f"🧠 Магия класса: {ability}",
+        f"🎯 КС спасброска от заклинаний: {character.spell_save_dc} | "
+        f"✨ Атака заклинанием: {format_modifier(character.spell_attack_bonus)}",
+        "",
+        "📖 Ячейки заклинаний",
+        *format_slots_tracker(character.spell_slots),
+        "",
+        f"🌟 Заговоры ({len(character.cantrips)})",
+    ]
+    if character.cantrips:
+        lines.extend(f" • {name}" for name in character.cantrips)
+    else:
+        lines.append(" • (нет)")
+
+    lines.append("")
+    if is_spontaneous_caster(character.class_name):
+        lines.append(
+            f"📚 Изученные заклинания ({len(character.spells_known)}), "
+            "все готовы к применению"
+        )
+    else:
+        lines.append(
+            f"📚 Готовые заклинания ({len(character.spells_prepared)}/"
+            f"{character.max_prepared})"
+        )
+
+    if character.spells_prepared:
+        lines.extend(
+            f" • {name} ({_spell_circle_label(character.spell_circle(name))})"
+            for name in character.spells_prepared
+        )
+    elif is_spontaneous_caster(character.class_name):
+        lines.append(" • (нет изученных заклинаний)")
+    else:
+        lines.append(" • (нет — заготовь их в разделе «⚡ Подготовка»)")
+    return "\n".join(lines)
+
+
+def format_cast_menu(character: Character) -> str:
+    """Карточка «🔥 Что применить»: трекер ячеек и список доступных заклинаний."""
+    lines = [
+        CAST_MENU_TEXT,
+        "",
+        format_hud(character),
+        "",
+        "📖 Ячейки заклинаний",
+        *format_slots_tracker(character.spell_slots),
+        "",
+    ]
+    if character.available_slots == 0:
+        # Ячейки кончились: объясняем значок 🔒 до списка заклинаний.
+        lines.append(NO_SLOTS_ALERT)
+    lines.append("🪄 Доступно сейчас:")
+    spells = character.castable_spells()
+    if not spells:
+        lines.append(" • (нечего применять)")
+    for name, circle in spells:
+        mark = "🔒" if _spell_circle_locked(character, circle) else "•"
+        lines.append(f" {mark} {name} ({_spell_circle_label(circle)})")
+    return "\n".join(lines)
+
+
+def format_prep_menu(character: Character) -> str:
+    """Карточка «⚡ Подготовка заклинаний»: изученные заклинания с метками готовности."""
+    if not character.is_spellcaster:
+        return NOT_SPELLCASTER_TEXT
+
+    if is_spontaneous_caster(character.class_name):
+        header = ["⚡ ПОДГОТОВКА ЗАКЛИНАНИЙ", "", SPONTANEOUS_PREP_ALERT]
+    else:
+        header = [
+            PREP_MENU_TEXT,
+            "",
+            f"Заготовлено {len(character.spells_prepared)} из {character.max_prepared} "
+            f"(уровень {character.level} + модификатор характеристики).",
+        ]
+
+    lines = [*header, "", "📚 Изученные заклинания"]
+    if character.spells_known:
+        for name in character.spells_known:
+            mark = "✅" if name in character.spells_prepared else "❌"
+            lines.append(f" {mark} {name} ({_spell_circle_label(character.spell_circle(name))})")
+    else:
+        lines.append(" • (нет)")
+    return "\n".join(lines)
+
+
+def format_rest_menu(character: Character) -> str:
+    """Карточка «🌙 Отдых»: что восстановит короткий и продолжительный отдых."""
+    lines = [
+        REST_MENU_TEXT,
+        "",
+        f"❤️ HP: {character.current_hp}/{character.max_hp} "
+        f"[{hp_progress_bar(character.current_hp, character.max_hp)}]",
+        "",
+    ]
+    if character.is_spellcaster:
+        lines.append("📖 Ячейки сейчас")
+        lines.extend(format_slots_tracker(character.spell_slots))
+        if is_pact_caster(character.class_name):
+            lines.append("☝️ Колдун: короткий отдых тоже восстанавливает магию пакта.")
+        else:
+            lines.append("☝️ На коротком отдыхе ячейки не восстанавливаются.")
+    else:
+        lines.append(REST_NOT_CASTERTEXT)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1416,6 +2187,7 @@ def hero_summary(character: Character) -> str:
         f"имя: {character.name}",
         f"вид (раса): {character.race}",
         f"класс: {character.class_name}",
+        f"сеттинг: {setting_label(character.setting)}",
         f"уровень: {character.level}",
         f"HP: {character.current_hp}/{character.max_hp}",
         f"КД: {character.armor_class}",
@@ -1425,19 +2197,36 @@ def hero_summary(character: Character) -> str:
         parts.append(f"описание: {character.description}")
     if character.inventory:
         parts.append("снаряжение: " + ", ".join(character.inventory))
+    if character.is_spellcaster:
+        # Состояние магии: Мастеру важно знать ячейки и готовые заклинания прямо в промпте.
+        slots = ", ".join(
+            f"{_spell_circle_label(int(circle))} {slot['current']}/{slot['total']}"
+            for circle, slot in sorted(character.spell_slots.items(), key=lambda pair: int(pair[0]))
+        )
+        parts.append(
+            f"магия: КС спасброска {character.spell_save_dc}, атака заклинанием "
+            f"{format_modifier(character.spell_attack_bonus)}, ячейки: {slots or 'нет'}; "
+            f"заговоры: {', '.join(character.cantrips) or 'нет'}; "
+            f"готовые заклинания: {', '.join(character.spells_prepared) or 'нет'}"
+        )
     return "Данные героя — " + "; ".join(parts) + "."
 
 
 def creation_prompt(session: Session) -> str:
-    """Инструкция Мастеру в фазе создания: первое сообщение игры или продолжение."""
-    if len(session.history) <= 1:
-        return HERO_CREATION_START_PROMPT
-    return HERO_CREATION_PROMPT
+    """Инструкция Мастеру в фазе создания: первое сообщение игры или продолжение.
+
+    Для сеттинга Warcraft к инструкции добавляется подсказка о видах Азерота и
+    классах PHB 2024 (см. WARCRAFT_CREATION_ADDENDUM).
+    """
+    prompt = HERO_CREATION_START_PROMPT if len(session.history) <= 1 else HERO_CREATION_PROMPT
+    if normalize_setting(session.character.setting) == SETTING_WARCRAFT:
+        return f"{prompt}\n{WARCRAFT_CREATION_ADDENDUM}"
+    return prompt
 
 
 def hero_confirmation_prompt(character: Character) -> str:
     """Инструкция Мастеру: герой создан, но игрок его ещё не подтвердил."""
-    return (
+    prompt = (
         "[СИСТЕМА] Этап создания персонажа: герой записан в лист, но игрок его ещё НЕ подтвердил. "
         "Приключение и пролог начинать ЗАПРЕЩЕНО.\n"
         f"{hero_summary(character)}\n"
@@ -1447,24 +2236,38 @@ def hero_confirmation_prompt(character: Character) -> str:
         "подтвердить героя. В конце спроси, всё ли верно с героем: подтвердить можно словом «да» "
         "или кнопкой «✅ Подтвердить героя». Пролог не начинай."
     )
+    if normalize_setting(character.setting) == SETTING_WARCRAFT:
+        return f"{prompt}\n{WARCRAFT_CREATION_ADDENDUM}"
+    return prompt
 
 
 def prologue_prompt(character: Character) -> str:
     """Инструкция Мастеру начать вводную сцену после подтверждения героя."""
+    if normalize_setting(character.setting) == SETTING_WARCRAFT:
+        # В Азероте мир и завязка берутся из хроники — «придумывать название мира» нельзя.
+        scene = (
+            "начни вводную сцену пролога в мире Азерота (20–27 гг. ADP): атмосферно опиши, где и "
+            "как начинается путь героя, бери место, время и обстановку из хроники Warcraft, покажи "
+            "одну из сил эпохи (Альянс, Орда, Плеть, Культ Проклятых) и придумай короткую завязку "
+            "в духе тёмного героического фэнтези, дай одну-две зацепки и остановись в точке выбора."
+        )
+    else:
+        scene = (
+            "начни вводную сцену пролога по правилам D&D 2024: атмосферно опиши, где и как "
+            "начинается путь героя, придумай название мира и короткую завязку в духе тёмного "
+            "героического фэнтези, дай одну-две зацепки и остановись в точке выбора."
+        )
     return (
         "[СИСТЕМА] Игрок подтвердил героя. Этап создания персонажа завершён — начинается игра.\n"
         f"{hero_summary(character)}\n"
-        "Задание: начни вводную сцену пролога по правилам D&D 2024: атмосферно опиши, где и как "
-        f"начинается путь героя, назови его по имени («{character.name}, твоя история "
-        "начинается…»), придумай название мира и короткую завязку в духе тёмного героического "
-        "фэнтези, дай одну-две зацепки и остановись в точке выбора. НЕ описывай действия, слова и "
-        "мысли героя игрока. Закончи вопросом «Что ты делаешь?»"
+        f"Задание: {scene} Назови героя по имени («{character.name}, твоя история начинается…»). "
+        "НЕ описывай действия, слова и мысли героя игрока. Закончи вопросом «Что ты делаешь?»"
     )
 
 
 def random_hero_prompt(character: Character) -> str:
     """Инструкция Мастеру представить уже сгенерированного кодом случайного героя."""
-    return (
+    prompt = (
         "[СИСТЕМА] Игрок выбрал случайного героя: система уже сгенерировала его строго по "
         "правилам PHB 2024 (характеристики, HP, стартовое снаряжение и золото) и записала в лист "
         "персонажа.\n"
@@ -1473,6 +2276,13 @@ def random_hero_prompt(character: Character) -> str:
         "характер. Приключение НЕ начинай и пролог не описывай: попроси игрока подтвердить героя "
         "(«да» или кнопка «✅ Подтвердить героя»)."
     )
+    if normalize_setting(character.setting) == SETTING_WARCRAFT:
+        prompt += (
+            "\nПредставляй героя как жителя Азерота (20–27 гг. ADP): упомяни его родной город или "
+            "фракцию из хроники Warcraft, подходящие его виду и классу. Правила героя остаются "
+            "D&D 2024."
+        )
+    return prompt
 
 
 def is_random_hero_request(text: str) -> bool:
@@ -1612,6 +2422,16 @@ def apply_starter_loadout(character: Character, recalc_hp: bool = False) -> list
                 f"❤️ Здоровье 1-го уровня: d{character.hit_die} + модификатор ТЕЛ = "
                 f"{character.max_hp} HP."
             )
+
+    # Магия: характеристики уже выставлены, поэтому лимит подготовки известен точно —
+    # заполняем заговоры, изученные и заготовленные заклинания по умолчанию.
+    if character.is_spellcaster:
+        character.init_default_spellcasting()
+        notes.append(
+            f"🪄 Магия класса готова: КС спасброска {character.spell_save_dc}, "
+            f"заговоры: {', '.join(character.cantrips) or 'нет'}; "
+            f"заготовлено: {', '.join(character.spells_prepared) or 'нет'}."
+        )
 
     return notes
 
@@ -1981,6 +2801,14 @@ def build_action_keyboard(character: Character) -> InlineKeyboardMarkup:
     rows.append(
         [InlineKeyboardButton(text="🧠 Проверки по статам", callback_data="checks")]
     )
+    # Магический раздел показываем только заклинателям: у остальных он бесполезен.
+    if character.is_spellcaster:
+        rows.append(
+            [
+                InlineKeyboardButton(text="📜 Заклинания", callback_data="spells"),
+                InlineKeyboardButton(text="🌙 Отдых", callback_data="rest"),
+            ]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1998,6 +2826,100 @@ def build_checks_keyboard(character: Character) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _spell_button(
+    character: Character, prefix: str, index: int, name: str, circle: int
+) -> InlineKeyboardButton:
+    """Кнопка заклинания: ``prefix`` — «cast» (применить) или «prep» (подготовить).
+
+    ``callback_data`` короткая («cast:2»/«prep:5») — это индекс в списке заклинаний,
+    потому что имена заклинаний на русском не укладываются в лимит 64 байта.
+    """
+    if prefix == "cast":
+        mark = "🔒" if _spell_circle_locked(character, circle) else ("🪄" if circle == 0 else "🔥")
+    else:
+        mark = "✅" if name in character.spells_prepared else "❌"
+    return InlineKeyboardButton(
+        text=f"{mark} {name} ({_spell_circle_label(circle)})",
+        callback_data=f"{prefix}:{index}",
+    )
+
+
+def build_spells_keyboard(character: Character) -> InlineKeyboardMarkup:
+    """Сетка раздела магии: применение, подготовка (если нужно) и отдых."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if character.is_spellcaster:
+        rows.append(
+            [InlineKeyboardButton(text="🔥 Применить заклинание", callback_data="cast")]
+        )
+        if not is_spontaneous_caster(character.class_name):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="⚡ Подготовка "
+                        f"({len(character.spells_prepared)}/{character.max_prepared})",
+                        callback_data="prep",
+                    )
+                ]
+            )
+        rows.append([InlineKeyboardButton(text="🌙 Отдохнуть", callback_data="rest")])
+    rows.append([InlineKeyboardButton(text="⬅️ Быстрые действия", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_cast_keyboard(character: Character) -> InlineKeyboardMarkup:
+    """Кнопки применения: по одной на каждый заговор и готовое заклинание."""
+    rows = [
+        [_spell_button(character, "cast", index, name, circle)]
+        for index, (name, circle) in enumerate(character.castable_spells())
+    ]
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="cast")])
+    rows.append([InlineKeyboardButton(text="⬅️ Книга заклинаний", callback_data="spells")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_prep_keyboard(character: Character) -> InlineKeyboardMarkup:
+    """Кнопки подготовки: ✅/❌ на каждое изученное заклинание (кроме спонтанных)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if character.is_spellcaster and not is_spontaneous_caster(character.class_name):
+        for index, name in enumerate(character.spells_known):
+            rows.append(
+                [_spell_button(character, "prep", index, name, character.spell_circle(name))]
+            )
+    rows.append([InlineKeyboardButton(text="⬅️ Книга заклинаний", callback_data="spells")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_rest_keyboard(character: Character) -> InlineKeyboardMarkup:
+    """Кнопки отдыха: короткий (1 час) и продолжительный (8 часов)."""
+    rows = [
+        [InlineKeyboardButton(text="☕ Короткий отдых (1 час)", callback_data="rest:short")],
+        [InlineKeyboardButton(text="🌙 Продолжительный отдых (8 часов)", callback_data="rest:long")],
+        [InlineKeyboardButton(text="⬅️ Книга заклинаний", callback_data="spells")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Кнопки выбора мира игры (сеттинга): показываются в самом начале создания персонажа,
+# до выбора вида и класса героя. callback_data — «setting:dnd_classic» / «setting:warcraft»,
+# оба значения укладываются в лимит Telegram в 64 байта.
+SETTINGS_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎲 Забытые Королевства (D&D)",
+                callback_data=f"{SETTING_CALLBACK_PREFIX}{SETTING_DND_CLASSIC}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⚔️ Вселенная Warcraft (Азерот)",
+                callback_data=f"{SETTING_CALLBACK_PREFIX}{SETTING_WARCRAFT}",
+            )
+        ],
+    ]
+)
+
+
 # Кнопки этапа создания персонажа: пока герой не подтверждён, показываем именно их.
 CREATION_KEYBOARD = InlineKeyboardMarkup(
     inline_keyboard=[
@@ -2007,6 +2929,7 @@ CREATION_KEYBOARD = InlineKeyboardMarkup(
         ],
         [
             InlineKeyboardButton(text="📜 Лист", callback_data="sheet"),
+            InlineKeyboardButton(text="🌍 Выбор мира", callback_data="settings"),
         ],
     ]
 )
@@ -2033,14 +2956,16 @@ def _json_has_key(payload: Any, key: str) -> bool:
 
 
 # Схема создаётся при первом подключении; IF NOT EXISTS — безопасно повторять.
-# Колонки location/quest дублируют сводку локации (HUD) из JSON — их удобно читать
-# SQL-запросами и отлаживать, а источником истины остаётся колонка data.
+# Колонки location/quest дублируют сводку локации (HUD) из JSON, а setting дублирует
+# выбранный сеттинг партии — их удобно читать SQL-запросами и отлаживать,
+# а источником истины остаётся колонка data.
 DB_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS characters (
     user_id    INTEGER PRIMARY KEY,
     data       TEXT      NOT NULL,
     location   TEXT      NOT NULL DEFAULT '{DEFAULT_LOCATION}',
     quest      TEXT      NOT NULL DEFAULT '{DEFAULT_QUEST}',
+    setting    TEXT      NOT NULL DEFAULT '{SETTING_DND_CLASSIC}',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -2098,10 +3023,11 @@ class BotDatabase:
         self._conn = conn
         return conn
 
-    # Колонки сводки локации (HUD), добавленные в схему позже.
-    _CHARACTER_HUD_COLUMNS: tuple[tuple[str, str], ...] = (
+    # Колонки, добавленные в схему позже: сводка локации (HUD) и сеттинг партии.
+    _CHARACTER_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
         ("location", f"TEXT NOT NULL DEFAULT '{DEFAULT_LOCATION}'"),
         ("quest", f"TEXT NOT NULL DEFAULT '{DEFAULT_QUEST}'"),
+        ("setting", f"TEXT NOT NULL DEFAULT '{SETTING_DND_CLASSIC}'"),
     )
 
     @classmethod
@@ -2110,9 +3036,12 @@ class BotDatabase:
 
         Нужно для баз, созданных прежними версиями бота: CREATE TABLE IF NOT EXISTS
         новые колонки в уже существующую таблицу не добавляет. Вызывать под self._lock.
+
+        Старые записи автоматически получают setting = 'dnd_classic' (значение по
+        умолчанию колонки), то есть существующие герои остаются в классическом D&D.
         """
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(characters)")}
-        for name, definition in cls._CHARACTER_HUD_COLUMNS:
+        for name, definition in cls._CHARACTER_EXTRA_COLUMNS:
             if name not in existing:
                 conn.execute(f"ALTER TABLE characters ADD COLUMN {name} {definition}")
                 logger.info("В таблицу characters добавлена колонка %s.", name)
@@ -2136,18 +3065,25 @@ class BotDatabase:
         """Сохраняет (или обновляет) лист персонажа игрока.
 
         Весь лист лежит в JSON-колонке data, а сводка локации (location/quest)
-        дополнительно дублируется в одноимённые колонки таблицы.
+        и выбранный сеттинг (setting) дополнительно дублируются в одноимённые
+        колонки таблицы.
         """
         payload = character.to_json()
         with self._lock:
             conn = self._connect()
             conn.execute(
-                "INSERT INTO characters (user_id, data, location, quest, updated_at) "
-                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "INSERT INTO characters (user_id, data, location, quest, setting, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
                 "ON CONFLICT(user_id) DO UPDATE SET "
                 "data = excluded.data, location = excluded.location, quest = excluded.quest, "
-                "updated_at = CURRENT_TIMESTAMP",
-                (int(user_id), payload, character.location, character.quest),
+                "setting = excluded.setting, updated_at = CURRENT_TIMESTAMP",
+                (
+                    int(user_id),
+                    payload,
+                    character.location,
+                    character.quest,
+                    normalize_setting(character.setting),
+                ),
             )
             conn.commit()
 
@@ -2155,7 +3091,7 @@ class BotDatabase:
         """Возвращает сохранённый лист персонажа или None, если записи ещё нет."""
         with self._lock:
             row = self._connect().execute(
-                "SELECT data, location, quest FROM characters WHERE user_id = ?",
+                "SELECT data, location, quest, setting FROM characters WHERE user_id = ?",
                 (int(user_id),),
             ).fetchone()
         if row is None:
@@ -2166,6 +3102,9 @@ class BotDatabase:
             character.location = (row["location"] or "").strip()[:120] or DEFAULT_LOCATION
         if not _json_has_key(row["data"], "quest"):
             character.quest = (row["quest"] or "").strip()[:120] or DEFAULT_QUEST
+        # Старые герои не знали о сеттингах: они автоматически остаются в классическом D&D.
+        if not _json_has_key(row["data"], "setting"):
+            character.setting = normalize_setting(row["setting"] or SETTING_DND_CLASSIC)
         return character
 
     # --- таблица chat_history ---
@@ -2211,6 +3150,10 @@ db = BotDatabase()
 # 8. ПАМЯТЬ ДИАЛОГА И СЕССИИ (на каждого пользователя отдельно)
 # ---------------------------------------------------------------------------
 
+# Отложенное действие сессии: игрок начал создание героя командой /hero — значит,
+# сразу после выбора сеттинга код должен собрать случайного героя (см. handle_setting_button).
+PENDING_RANDOM_HERO = "random_hero"
+
 
 class Session:
     """
@@ -2222,12 +3165,15 @@ class Session:
     поднимается из базы (см. Session.restore).
     """
 
-    __slots__ = ("user_id", "history", "character")
+    __slots__ = ("user_id", "history", "character", "pending_action")
 
     def __init__(self, user_id: int) -> None:
         self.user_id: int = int(user_id)
         self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
         self.character: Character = Character()
+        # Что сделать сразу после выбора сеттинга (например, собрать случайного героя).
+        # Поле только в памяти: при перезапуске бота просто теряется — игрок нажмёт кнопку снова.
+        self.pending_action: Optional[str] = None
 
     @classmethod
     def restore(cls, user_id: int) -> "Session":
@@ -2252,6 +3198,7 @@ class Session:
         """Полностью очищает историю и создаёт нового персонажа (память + база)."""
         self.history.clear()
         self.character = Character()
+        self.pending_action = None
         db.clear_user(self.user_id)
         db.save_character(self.user_id, self.character)
 
@@ -2353,14 +3300,19 @@ async def _create_chat_completion(messages: list[dict[str, str]]):
     raise last_error
 
 
-async def ask_dungeon_master(history: Iterable[dict[str, str]]) -> str:
+async def ask_dungeon_master(
+    history: Iterable[dict[str, str]],
+    setting: str = SETTING_DND_CLASSIC,
+) -> str:
     """
     Отправляет историю диалога Мастеру и возвращает текст ответа.
 
-    Системный промпт добавляется к каждому запросу, а сама история уже
-    ограничена по длине (см. Session). Запрос выполняется с повторами при
+    Системный промпт собирается под сеттинг партии (см. build_system_prompt):
+    для «Вселенной Warcraft» в него подмешивается хроника Азерота. Сама история
+    уже ограничена по длине (см. Session). Запрос выполняется с повторами при
     временных сбоях (см. _create_chat_completion).
 
+    :param setting: сеттинг партии — "dnd_classic" или "warcraft".
     :raise RuntimeError: если клиент не инициализирован или ответ пуст.
     :raise APIError: если LLM недоступен даже после повторов.
     """
@@ -2368,7 +3320,7 @@ async def ask_dungeon_master(history: Iterable[dict[str, str]]) -> str:
         raise RuntimeError("LLM_API_KEY не задан — клиент LLM недоступен.")
 
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": build_system_prompt(setting)},
         *history,
     ]
 
@@ -2506,7 +3458,10 @@ async def _answer_with_dungeon_master(
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
     try:
-        raw_reply = await ask_dungeon_master(session.messages())
+        raw_reply = await ask_dungeon_master(
+            session.messages(),
+            setting=session.character.setting,
+        )
     except APIError as error:
         logger.error("Ошибка LLM / DeepSeek API: %s", error)
         await message.answer(API_ERROR_TEXT)
@@ -2600,9 +3555,23 @@ def _callback_context(callback: CallbackQuery) -> Optional[tuple[Message, int]]:
     return callback.message, callback.from_user.id
 
 
+async def _send_settings_menu(message: Message, note: str = "") -> None:
+    """Шаг 0 создания персонажа: предлагает выбрать мир игры (D&D или Warcraft).
+
+    Кнопки SETTINGS_KEYBOARD разбирает handle_setting_button: он записывает
+    выбранный сеттинг в лист персонажа и передаёт ход следующему шагу.
+    """
+    text = f"{note}\n\n{SETTING_MENU_TEXT}" if note else SETTING_MENU_TEXT
+    await message.answer(text, reply_markup=SETTINGS_KEYBOARD)
+
+
 async def _begin_hero_creation(message: Message, session: Session) -> None:
-    """Этап 1: просит Мастера поприветствовать игрока и создать героя (приключение не начинается)."""
-    session.add("user", HERO_CREATION_START_PROMPT)
+    """Этап 1: просит Мастера поприветствовать игрока и создать героя (приключение не начинается).
+
+    Инструкция зависит от сеттинга: в Warcraft Мастер предлагает виды Азерота
+    (см. creation_prompt и WARCRAFT_CREATION_ADDENDUM).
+    """
+    session.add("user", creation_prompt(session))
     await _answer_with_dungeon_master(message, session)
 
 
@@ -2621,7 +3590,10 @@ async def _send_hero_card(
 
 async def _create_random_hero(message: Message, session: Session) -> None:
     """Генерирует случайного героя кодом по правилам PHB 2024 и просит Мастера его представить."""
+    # Сеттинг — выбор игрока, а не свойство героя: переносим его на нового персонажа.
+    chosen_setting = normalize_setting(session.character.setting)
     hero = build_random_hero()
+    hero.setting = chosen_setting
 
     # Имя и описание, которые игрок успел назвать сам, не теряем.
     if session.character.name != DEFAULT_NAME:
@@ -2663,7 +3635,8 @@ async def handle_start(message: Message) -> None:
     session.clear()
 
     await message.answer(WELCOME_TEXT)
-    await _begin_hero_creation(message, session)
+    # Шаг 0 создания героя: сначала игрок выбирает мир игры (D&D или Warcraft).
+    await _send_settings_menu(message)
     logger.info("Пользователь %s начал создание персонажа", user.id)
 
 
@@ -2680,7 +3653,8 @@ async def handle_reset(message: Message) -> None:
         "🔄 Контекст полностью сброшен: прошлый герой и история удалены.\n"
         "Создаём нового героя…"
     )
-    await _begin_hero_creation(message, session)
+    # Сброс начинается с выбора мира — сеттинг прошлой партии не наследуется.
+    await _send_settings_menu(message)
     logger.info("Пользователь %s сбросил сессию", user.id)
 
 
@@ -2697,7 +3671,9 @@ async def handle_random_hero(message: Message) -> None:
         )
         return
 
-    await _create_random_hero(message, session)
+    # Сначала мир игры: обработчик кнопки соберёт героя сразу после выбора сеттинга.
+    session.pending_action = PENDING_RANDOM_HERO
+    await _send_settings_menu(message, HERO_SETTING_FIRST_NOTE)
     logger.info("Пользователь %s вызвал случайного героя командой", message.from_user.id)
 
 
@@ -2739,6 +3715,98 @@ async def handle_check(message: Message) -> None:
         reply_markup=build_checks_keyboard(session.character),
     )
     logger.info("Пользователь %s открыл меню проверок", message.from_user.id)
+
+
+@router.message(Command("spells"))
+async def handle_spells(message: Message) -> None:
+    """/spells — книга заклинаний: ячейки, заговоры и готовые заклинания."""
+    if message.from_user is None:
+        return
+    session = get_session(message.from_user.id)
+    await send_long_message(
+        message,
+        format_spells_card(session.character),
+        reply_markup=build_spells_keyboard(session.character),
+    )
+    logger.info("Пользователь %s открыл книгу заклинаний", message.from_user.id)
+
+
+@router.message(Command("rest"))
+async def handle_rest(message: Message) -> None:
+    """/rest — меню отдыха: короткий (1 час) и продолжительный (8 часов)."""
+    if message.from_user is None:
+        return
+    session = get_session(message.from_user.id)
+    await message.answer(
+        format_rest_menu(session.character),
+        reply_markup=build_rest_keyboard(session.character),
+    )
+    logger.info("Пользователь %s открыл меню отдыха", message.from_user.id)
+
+
+@router.callback_query(F.data == "settings")
+async def handle_settings_button(callback: CallbackQuery) -> None:
+    """Кнопка «🌍 Выбор мира» в клавиатуре создания героя: повторно показывает меню сеттингов."""
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+    if get_session(target[1]).character.hero_confirmed:
+        await callback.answer(HERO_ALREADY_CONFIRMED_ALERT, show_alert=True)
+        return
+
+    await callback.answer()
+    message, user_id = target
+    logger.info("Пользователь %s открыл выбор мира игры кнопкой", user_id)
+    await _send_settings_menu(message)
+
+
+@router.callback_query(F.data.startswith(SETTING_CALLBACK_PREFIX))
+async def handle_setting_button(callback: CallbackQuery) -> None:
+    """Кнопки выбора мира: «🎲 Забытые Королевства (D&D)» и «⚔️ Вселенная Warcraft (Азерот)».
+
+    Шаг 0 создания персонажа: записываем сеттинг в лист игрока, подтверждаем выбор
+    и передаём ход следующему шагу (сбор случайного героя или приветствие Мастера).
+    """
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+
+    data = callback.data or ""
+    raw_setting = data[len(SETTING_CALLBACK_PREFIX):].strip().lower()
+    if raw_setting not in SETTING_CHOICES:
+        await callback.answer(UNKNOWN_BUTTON_TEXT, show_alert=True)
+        return
+    setting = normalize_setting(raw_setting)
+
+    message, user_id = target
+    session = get_session(user_id)
+    session.character.setting = setting
+    session.save_character()
+    await callback.answer(f"Мир игры: {setting_label(setting)}")
+    logger.info("Пользователь %s выбрал сеттинг %s", user_id, setting)
+
+    # Герой уже подтверждён (кнопка из старого сообщения): просто переключаем мир.
+    if session.character.hero_confirmed:
+        await message.answer(
+            SETTING_SWITCHED_TEXT.format(label=setting_label(setting)),
+            reply_markup=build_action_keyboard(session.character),
+        )
+        return
+
+    # Следующий шаг создания героя: сначала подтверждение выбранного мира.
+    confirmation = (
+        SETTING_CONFIRM_WARCRAFT if setting == SETTING_WARCRAFT else SETTING_CONFIRM_DND
+    )
+    await message.answer(confirmation, reply_markup=CREATION_KEYBOARD)
+
+    pending_action = session.pending_action
+    session.pending_action = None
+    if pending_action == PENDING_RANDOM_HERO:
+        await _create_random_hero(message, session)
+    else:
+        await _begin_hero_creation(message, session)
 
 
 @router.callback_query(F.data == "hero:random")
@@ -2855,6 +3923,264 @@ async def handle_menu_button(callback: CallbackQuery) -> None:
         ACTION_MENU_TEXT,
         reply_markup=build_action_keyboard(session.character),
     )
+
+
+# ---------------------------------------------------------------------------
+# МАГИЯ: применение заклинаний, подготовка и отдых
+# ---------------------------------------------------------------------------
+# callback_data раздела: «spells» (книга заклинаний), «cast»/«cast:N» (применить
+# заклинание №N из списка доступных), «prep»/«prep:N» (подготовка №N из изученных),
+# «rest»/«rest:short»/«rest:long» (отдых). Индексы вместо названий — потому что
+# русские имена заклинаний не помещаются в лимит 64 байта callback_data.
+
+
+@router.callback_query(F.data == "spells")
+async def handle_spells_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка «📜 Заклинания»: карточка книги заклинаний героя."""
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+    # Гасим «часики» на кнопке — обязательно для любой CallbackQuery.
+    await callback.answer()
+
+    message, user_id = target
+    session = get_session(user_id)
+    await send_long_message(
+        message,
+        format_spells_card(session.character),
+        reply_markup=build_spells_keyboard(session.character),
+    )
+    logger.info("Пользователь %s открыл книгу заклинаний кнопкой", user_id)
+
+
+@router.callback_query(F.data == "cast")
+async def handle_cast_menu_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка «🔥 Применить заклинание»: список заклинаний с кнопками."""
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+
+    message, user_id = target
+    session = get_session(user_id)
+    if not session.character.is_spellcaster:
+        await callback.answer(NOT_SPELLCASTER_TEXT, show_alert=True)
+        return
+    await callback.answer()
+
+    await send_long_message(
+        message,
+        format_cast_menu(session.character),
+        reply_markup=build_cast_keyboard(session.character),
+    )
+    logger.info("Пользователь %s открыл список применения заклинаний", user_id)
+
+
+@router.callback_query(F.data.startswith("cast:"))
+async def handle_cast_spell_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка заклинания: код тратит ячейку круга и передаёт применение Мастеру.
+
+    Заговоры ячеек не тратят. Если ячеек нужного круга нет, игрок получает подсказку,
+    а лист персонажа остаётся без изменений.
+    """
+    raw_index = (callback.data or "").split(":", 1)[-1]
+
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+
+    message, user_id = target
+    session = get_session(user_id)
+    character = session.character
+
+    # Индекс кнопки сверяем со списком на момент нажатия: меню могло устареть.
+    spells = character.castable_spells()
+    index = int(raw_index) if raw_index.isdigit() else -1
+    if not 0 <= index < len(spells):
+        await callback.answer(SPELL_MENU_STALE_TEXT, show_alert=True)
+        return
+
+    name, _circle = spells[index]
+    result = character.cast_spell(name)
+    if not result.ok:
+        await callback.answer(result.alert, show_alert=True)
+        return
+    await callback.answer()
+
+    # Ячейка уже списана — сразу фиксируем лист в базе, чтобы прогресс не потерялся.
+    session.save_character()
+    await message.answer(result.note)
+    logger.info(
+        "Пользователь %s применил заклинание «%s» (свободных ячеек осталось: %s)",
+        user_id,
+        name,
+        character.available_slots,
+    )
+
+    session.add("user", result.context)
+    await _answer_with_dungeon_master(message, session)
+
+
+@router.callback_query(F.data == "prep")
+async def handle_prep_menu_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка «⚡ Подготовка»: список изученных заклинаний с метками ✅/❌."""
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+
+    message, user_id = target
+    session = get_session(user_id)
+    character = session.character
+    if not character.is_spellcaster:
+        await callback.answer(NOT_SPELLCASTER_TEXT, show_alert=True)
+        return
+    if is_spontaneous_caster(character.class_name):
+        # Барды, Чародеи и Колдуны знают фиксированный список — готовить заранее нечего.
+        await callback.answer(SPONTANEOUS_PREP_ALERT, show_alert=True)
+        return
+    await callback.answer()
+
+    await message.answer(
+        format_prep_menu(character),
+        reply_markup=build_prep_keyboard(character),
+    )
+    logger.info("Пользователь %s открыл подготовку заклинаний", user_id)
+
+
+@router.callback_query(F.data.startswith("prep:"))
+async def handle_prepare_spell_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка заклинания в списке подготовки: заготовить его или снять.
+
+    Лимит подготовки на день равен «уровень класса + модификатор характеристики»
+    (минимум 1). Когда лимит исчерпан, подсказка просит сначала снять другое
+    заклинание — лист персонажа при этом не меняется.
+    """
+    raw_index = (callback.data or "").split(":", 1)[-1]
+
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+
+    message, user_id = target
+    session = get_session(user_id)
+    character = session.character
+    if not character.is_spellcaster:
+        await callback.answer(NOT_SPELLCASTER_TEXT, show_alert=True)
+        return
+    if is_spontaneous_caster(character.class_name):
+        await callback.answer(SPONTANEOUS_PREP_ALERT, show_alert=True)
+        return
+
+    index = int(raw_index) if raw_index.isdigit() else -1
+    if not 0 <= index < len(character.spells_known):
+        await callback.answer(SPELL_MENU_STALE_TEXT, show_alert=True)
+        return
+
+    name = character.spells_known[index]
+    if name in character.spells_prepared:
+        character.toggle_prepared(name)
+        note = f"❌ Снята готовность: {name}."
+    elif character.can_prepare_more():
+        character.toggle_prepared(name)
+        note = f"✅ Заготовлено: {name}."
+    else:
+        await callback.answer(
+            f"Лимит подготовки исчерпан ({len(character.spells_prepared)}/"
+            f"{character.max_prepared}). Сначала сними другое заклинание.",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
+
+    session.save_character()
+    logger.info("Пользователь %s изменил подготовку: %s", user_id, note)
+    await message.answer(
+        f"{note}\n\n{format_prep_menu(character)}",
+        reply_markup=build_prep_keyboard(character),
+    )
+
+
+@router.callback_query(F.data == "rest")
+async def handle_rest_menu_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка «🌙 Отдохнуть»: меню короткого и продолжительного отдыха."""
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+    await callback.answer()
+
+    message, user_id = target
+    session = get_session(user_id)
+    await message.answer(
+        format_rest_menu(session.character),
+        reply_markup=build_rest_keyboard(session.character),
+    )
+    logger.info("Пользователь %s открыл меню отдыха кнопкой", user_id)
+
+
+@router.callback_query(F.data.startswith("rest:"))
+async def handle_rest_button(callback: CallbackQuery) -> None:
+    """Инлайн-кнопка отдыха: короткий (1 час) — магия пакта, продолжительный (8 часов) — всё.
+
+    Продолжительный отдых дополнительно восстанавливает HP до максимума: хиты и
+    кости хитов в остальных местах бота живут отдельно, поэтому лечим здесь.
+    """
+    kind = (callback.data or "").split(":", 1)[-1]
+
+    target = _callback_context(callback)
+    if target is None:
+        await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+        return
+    if kind not in {"short", "long"}:
+        await callback.answer(UNKNOWN_BUTTON_TEXT, show_alert=True)
+        return
+
+    message, user_id = target
+    session = get_session(user_id)
+    character = session.character
+    long_rest = kind == "long"
+
+    notes = character.restore_spell_slots(long_rest)
+    if long_rest:
+        healed = character.max_hp - character.current_hp
+        character.current_hp = character.max_hp
+        hp_note = f"❤️ HP восстановлены: {character.current_hp}/{character.max_hp}"
+        notes.append(hp_note + (f" (+{healed})." if healed > 0 else "."))
+    elif not notes:
+        notes.append(
+            "Ячейки на коротком отдыхе восстанавливает только магия пакта Колдуна."
+            if character.is_spellcaster
+            else "У героя нет магии — восстанавливать ячейки не нужно."
+        )
+
+    await callback.answer()
+
+    session.save_character()
+    body = "\n".join(f"• {note}" for note in notes)
+    await message.answer(f"🌙 Отдых завершён:\n{body}")
+    logger.info(
+        "Пользователь %s завершил %s отдых",
+        user_id,
+        "продолжительный" if long_rest else "короткий",
+    )
+
+    if long_rest:
+        context = (
+            "[СИСТЕМА] Игрок завершил продолжительный отдых (8 часов): HP и ячейки "
+            "заклинаний полностью восстановлены. Опиши, как прошёл отдых и что герой "
+            "видит, проснувшись, затем вернись к текущей сцене."
+        )
+    else:
+        context = (
+            "[СИСТЕМА] Игрок совершил короткий отдых (1 час). Опиши короткую передышку "
+            "и чем герой занимался, затем вернись к текущей сцене."
+        )
+    session.add("user", context)
+    await _answer_with_dungeon_master(message, session)
 
 
 # Кнопки бросков: callback_data -> (режим d20, подпись для Мастера).
@@ -3041,8 +4367,8 @@ async def handle_unsupported(message: Message) -> None:
 
     await message.answer(
         "Я понимаю только текст и кнопки. Опиши своё действие словами, нажми кнопку "
-        "быстрого броска (🎲 d20, 🎲 Бросок урона, 🧠 Проверки по статам) "
-        "или используй команды /roll, /sheet, /inventory, /check.",
+        "быстрого броска (🎲 d20, 🎲 Бросок урона, 🧠 Проверки по статам, 📜 Заклинания) "
+        "или используй команды /roll, /sheet, /inventory, /check, /spells, /rest.",
         reply_markup=build_action_keyboard(session.character),
     )
 
@@ -3059,6 +4385,8 @@ BOT_COMMANDS = [
     BotCommand(command="sheet", description="Показать лист персонажа"),
     BotCommand(command="inventory", description="Показать снаряжение и золото"),
     BotCommand(command="check", description="Проверки характеристик с модификатором"),
+    BotCommand(command="spells", description="Книга заклинаний: ячейки, применение, подготовка"),
+    BotCommand(command="rest", description="Отдых: восстановить HP и ячейки заклинаний"),
 ]
 
 
