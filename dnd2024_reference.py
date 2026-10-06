@@ -131,62 +131,110 @@ CLASSES: dict[str, dict] = {
 DEFAULT_HIT_DIE = 8  # если класс персонажа ещё не определён
 
 # ---------------------------------------------------------------------------
-# РАСЫ / ВИДЫ (10 видов PHB 2024 — официальный список)
+# РАСЫ / ВИДЫ (10 видов PHB 2024 + «Возрождённый/Нежить» из Ravenloft)
 # ---------------------------------------------------------------------------
 
 # Формат: ключ -> {name: русское название, aliases: синонимы для распознавания текста,
-#                  brief: краткие черты вида (для промпта Мастера)}
+#                  brief: краткие черты вида (для промпта Мастера),
+#                  traits: перечень расовых особенностей (для листа персонажа и справочника)}
 SPECIES: dict[str, dict] = {
     "human": {
         "name": "Человек", "aliases": ("человек", "люди", "human"),
         "brief": "Универсал: дополнительный навык, черта происхождения «Изобретательность» "
                  "(после долгого отдыха — Вдохновение героя).",
+        "traits": ("Изобретательность: после долгого отдыха — Вдохновение героя",
+                   "Умелость: владение одним дополнительным навыком на выбор",
+                   "Разносторонность: одна черта происхождения на выбор"),
     },
     "elf": {
         "name": "Эльф", "aliases": ("эльф", "эльфийка", "elf"),
         "brief": "Тёмное зрение 60 футов, иммунитет к магическому сну, транс вместо сна (4 часа), "
                  "черта происхождения (Высший/Лесной/Дроу).",
+        "traits": ("Тёмное зрение 60 футов", "Иммунитет к магическому сну",
+                   "Транс вместо сна (4 часа)", "Черта происхождения: Высший/Лесной/Дроу"),
     },
     "dwarf": {
         "name": "Дварф", "aliases": ("дварф", "дварфы", "dwarf"),
         "brief": "Тёмное зрение 60 футов, сопротивление яду, «Дварфийская стойкость» "
                  "(+1 HP за уровень).",
+        "traits": ("Тёмное зрение 60 футов", "Сопротивление урону ядом",
+                   "Преимущество на спасброски от отравления",
+                   "Дварфийская стойкость: +1 HP за уровень"),
     },
     "gnome": {
         "name": "Гном", "aliases": ("гном", "gnome"),
         "brief": "Тёмное зрение 60 футов, преимущество на спасброски ИНТ/МУД/ХАР против магии, "
                  "«Гномья хитрость».",
+        "traits": ("Тёмное зрение 60 футов",
+                   "Преимущество на спасброски ИНТ/МУД/ХАР против магии",
+                   "Гномья хитрость"),
     },
     "halfling": {
         "name": "Полурослик", "aliases": ("полурослик", "халфлинг", "halfling"),
         "brief": "Маленький размер, «Везучий» (переброс «1» на d20), «Проворный», «Храбрый» "
                  "(преимущество против испуга).",
+        "traits": ("Маленький размер", "Везучий: переброс «1» на d20",
+                   "Проворный: движение через пространство существ крупнее",
+                   "Храбрый: преимущество на спасброски против испуга"),
     },
     "dragonborn": {
         "name": "Драконорождённый",
         "aliases": ("драконорождённый", "драконорожденный", "dragonborn"),
         "brief": "Оружие дыхания (2d6), сопротивление типу урона своего дракона, тёмное зрение 60 футов.",
+        "traits": ("Оружие дыхания (2d6)", "Сопротивление типу урона своего дракона",
+                   "Тёмное зрение 60 футов", "Полёт (на короткое время)"),
     },
     "tiefling": {
         "name": "Тифлинг", "aliases": ("тифлинг", "tiefling"),
         "brief": "Тёмное зрение 60 футов, сопротивление огню, врождённые заклинания "
                  "(фокус «Чудотворство» и др.).",
+        "traits": ("Тёмное зрение 60 футов", "Сопротивление урону огнём",
+                   "Врождённая магия: фокус «Чудотворство» и др."),
     },
     "orc": {
         "name": "Орк", "aliases": ("орк", "orc"),
         "brief": "Тёмное зрение 120 футов, «Прилив адреналина» (рывок бонусным действием "
                  "+ временные HP), «Непоколебимая стойкость» (при 0 HP остаётся 1 HP один "
                  "раз за долгий отдых).",
+        "traits": ("Тёмное зрение 120 футов",
+                   "Прилив адреналина: рывок бонусным действием и временные HP",
+                   "Непоколебимая стойкость: при 0 HP остаётся 1 HP (раз за долгий отдых)"),
     },
     "goliath": {
         "name": "Голиаф", "aliases": ("голиаф", "goliath"),
         "brief": "Крупное телосложение, «Каменная выносливость» (снижение урона 1d12 + ТЕЛ), "
                  "ускоренный подъём.",
+        "traits": ("Крупное телосложение",
+                   "Каменная выносливость: снижение урона 1d12 + мод. ТЕЛ",
+                   "Ускоренный подъём"),
     },
     "aasimar": {
         "name": "Аасимар", "aliases": ("аасимар", "aasimar"),
         "brief": "Небесное сопротивление (некротический и радиантный урон), «Исцеляющие руки», "
                  "тёмное зрение 60 футов.",
+        "traits": ("Небесное сопротивление: некротический и радиантный урон",
+                   "Исцеляющие руки: лечение прикосновением", "Тёмное зрение 60 футов",
+                   "Свет небес: полёт и дополнительный урон"),
+    },
+    # «Возрождённый/Нежить» (Reborn) — D&D-совместимый вид (Van Richten's Guide to Ravenloft).
+    # В сеттинге Warcraft ложится на Отрекшихся (свободную нежить).
+    "reborn": {
+        "name": "Возрождённый/Нежить",
+        "aliases": ("возрождённый", "возрожденный", "нежить", "reborn",
+                    "возрождённый/нежить", "возрожденный/нежить"),
+        "brief": "Гуманоид-нежить. Тип: гуманоид; размер Средний или Маленький; скорость 30 фт. "
+                 "Преимущество на спасброски от смерти; не страдает от жажды, голода и удушья, "
+                 "магия не может усыпить, долгий отдых — 4 часа в неподвижности при сохранении "
+                 "сознания; владение дополнительным навыком (при провале проверки — +1d6, число "
+                 "использований = бонус мастерства на долгий отдых); сопротивление одному виду "
+                 "урона на выбор (холод, некротический или яд) и преимущество на спасброски "
+                 "против яда и отравления.",
+        "traits": ("Избежавший смерти: преимущество на спасброски от смерти",
+                   "Вечный: не истощается от жажды, голода и удушья, не нуждается во сне, "
+                   "магия не может усыпить; долгий отдых — 4 часа в неподвижности",
+                   "Знания прошлой жизни (+1d6 к проваленной проверке; число раз = бонус мастерства)",
+                   "Необычная стойкость: сопротивление холоду, некротическому урону или яду "
+                   "(на выбор); преимущество на спасброски от яда и отравления"),
     },
 }
 
@@ -545,6 +593,18 @@ def species_name(species_name_text: str) -> Optional[str]:
     """Каноническое русское название вида по произвольному тексту (или None)."""
     key = resolve_species_key(species_name_text)
     return SPECIES[key]["name"] if key is not None else None
+
+
+def species_traits(species_name_text: str) -> tuple[str, ...]:
+    """Кортеж расовых особенностей вида по произвольному названию.
+
+    Возвращает пустой кортеж, если вид не распознан или у него нет описанных
+    особенностей. Используется листом персонажа (раздел «Черты (расовые)»).
+    """
+    key = resolve_species_key(species_name_text)
+    if key is None:
+        return ()
+    return tuple(SPECIES[key].get("traits", ()))
 
 
 def class_name_from_text(class_name_text: str) -> Optional[str]:
@@ -969,9 +1029,9 @@ def spellcasting_digest_lines() -> list[str]:
     return lines
 
 
-def build_reference_digest() -> str:
-    """Формирует компактную выжимку официальных правил D&D 2024 для промпта Мастера."""
-    lines: list[str] = [
+def _digest_classes_lines() -> list[str]:
+    """Секция справочника: шапка + список классов."""
+    lines = [
         "# ОФИЦИАЛЬНЫЙ СПРАВОЧНИК ПРАВИЛ D&D 2024 (Player's Handbook 2024)",
         "Ниже — единственный допустимый источник механических правил. Любые действия, классы, "
         "оружие, состояния и заклинания, которых здесь и в базовых правилах PHB 2024 нет, — "
@@ -985,12 +1045,45 @@ def build_reference_digest() -> str:
             f"осн. {_join_abilities(data['primary'])} | "
             f"спасброски: {_join_abilities(data['saves'])} | {data['brief']}"
         )
+    return lines
 
-    lines += ["", "## Виды (расы) персонажа — только эти 10 видов PHB 2024"]
-    for data in SPECIES.values():
-        lines.append(f"- {data['name']}: {data['brief']}")
 
-    lines += [
+def _species_entry_lines(data: dict) -> list[str]:
+    """Строка(и) одного вида: только расовые особенности (без дублирующего brief)."""
+    traits = data.get("traits", ())
+    if traits:
+        return [f"- {data['name']}: {'; '.join(traits)}."]
+    return [f"- {data['name']}: {data['brief']}"]
+
+
+def _digest_species(*, full: bool, species_name: Optional[str] = None) -> list[str]:
+    """Секция видов (рас).
+
+    full=True — все доступные виды (этап создания героя);
+    full=False — только расовые особенности текущего героя (игровой этап): это
+    экономит ~3 тыс. символов контекста на каждом запросе к модели.
+    """
+    if full:
+        lines = [
+            "",
+            "## Виды (расы) персонажа — только эти виды (10 PHB 2024 + «Возрождённый/Нежить»)",
+        ]
+        for data in SPECIES.values():
+            lines.extend(_species_entry_lines(data))
+        return lines
+    key = resolve_species_key(species_name) if species_name else None
+    if key is None:
+        return []
+    return [
+        "",
+        "## Вид (раса) героя — расовые особенности",
+        *_species_entry_lines(SPECIES[key]),
+    ]
+
+
+def _digest_creation_lines() -> list[str]:
+    """Секция создания персонажа 1-го уровня (нужна только на этапе создания)."""
+    lines = [
         "",
         "## Создание персонажа 1-го уровня",
         "- Характеристики: стандартный набор 15, 14, 13, 12, 10, 8 (или 4d6 без "
@@ -1005,23 +1098,39 @@ def build_reference_digest() -> str:
         kit = CLASS_STARTER_KITS.get(key, DEFAULT_STARTER_KIT)
         gp = CLASS_STARTING_GP.get(key, 0)
         lines.append(f"  • {data['name']}: {', '.join(kit)}; {gp} gp.")
+    return lines
 
-    lines += ["", "## Уровни, опыт и бонус мастерства"]
+
+def _digest_leveling_lines() -> list[str]:
+    """Секция уровней, опыта и бонуса мастерства."""
+    lines = ["", "## Уровни, опыт и бонус мастерства"]
     lines += [f"- {formula}" for formula in FORMULAS]
     xp_pairs = "; ".join(
         f"{level} ур. — {XP_THRESHOLDS[level]} XP" for level in range(2, MAX_LEVEL + 1)
     )
     lines.append(f"- Порог опыта (накопительно): {xp_pairs}.")
+    return lines
 
-    lines += ["", "## Оружие (урон | свойства | мастерство)"]
+
+def _digest_weapons_lines() -> list[str]:
+    """Секция оружия (урон, свойства, мастерство)."""
+    lines = ["", "## Оружие (урон | свойства | мастерство)"]
     for name, damage, damage_type, properties, mastery in WEAPONS:
         lines.append(f"- {name}: {damage} {damage_type} | {properties} | {mastery}")
+    return lines
 
-    lines += ["", "## Правила мастерства оружия (Weapon Mastery)"]
+
+def _digest_weapon_mastery_lines() -> list[str]:
+    """Секция правил мастерства оружия (Weapon Mastery)."""
+    lines = ["", "## Правила мастерства оружия (Weapon Mastery)"]
     for mastery_name, mastery_text in WEAPON_MASTERY.items():
         lines.append(f"- {mastery_name}: {mastery_text}")
+    return lines
 
-    lines += ["", "## Доспехи и щиты (КД)"]
+
+def _digest_armor_lines() -> list[str]:
+    """Секция доспехов и щитов (КД)."""
+    lines = ["", "## Доспехи и щиты (КД)"]
     for name, category, base_ac, max_dex, strength, stealth in ARMOR:
         if max_dex is None:
             dex_part = " + мод. ЛОВ"
@@ -1037,20 +1146,34 @@ def build_reference_digest() -> str:
         suffix = f" ({', '.join(detail)})" if detail else ""
         lines.append(f"- {name}: {category}, КД = {base_ac}{dex_part}{suffix}")
     lines.append(f"- Щит: +{SHIELD_BONUS} к КД.")
+    return lines
 
+
+def _digest_skills_lines() -> list[str]:
+    """Секция навыков (характеристика)."""
     skills = ", ".join(
         f"{skill} ({ABILITIES[ability]})" for skill, ability in SKILLS.items()
     )
-    lines += ["", "## Навыки (характеристика)", f"- {skills}"]
+    return ["", "## Навыки (характеристика)", f"- {skills}"]
 
-    lines += ["", "## Состояния (Conditions)"]
+
+def _digest_conditions_lines() -> list[str]:
+    """Секция состояний (Conditions)."""
+    lines = ["", "## Состояния (Conditions)"]
     for condition, text in CONDITIONS.items():
         lines.append(f"- {condition}: {text}")
+    return lines
 
+
+def _digest_difficulty_lines() -> list[str]:
+    """Секция сложностей (КС)."""
     dc_line = "; ".join(f"{name} — {value}" for name, value in DIFFICULTY_CLASSES.items())
-    lines += ["", "## Сложности (КС)", f"- {dc_line}."]
+    return ["", "## Сложности (КС)", f"- {dc_line}."]
 
-    lines += [
+
+def _digest_misc_lines() -> list[str]:
+    """Секция прочих механик (вдохновение, истощение, отдых, смерть, валюта, переноска, укрытия)."""
+    lines = [
         "",
         "## Прочие механики",
         f"- {HEROIC_INSPIRATION}",
@@ -1062,10 +1185,12 @@ def build_reference_digest() -> str:
     ]
     for cover_name, cover_text in COVER.items():
         lines.append(f"- {cover_name}: {cover_text}")
+    return lines
 
-    lines += spellcasting_digest_lines()
 
-    lines += [
+def _digest_limits_lines() -> list[str]:
+    """Секция жёстких ограничений по правилам (антивыдумка)."""
+    return [
         "",
         "## ЖЁСТКОЕ ОГРАНИЧЕНИЕ ПО ПРАВИЛАМ",
         "- Используй ТОЛЬКО перечисленные выше классы, оружие, доспехи, навыки, состояния и "
@@ -1078,5 +1203,34 @@ def build_reference_digest() -> str:
         "- Если механика не описана в этом справочнике и ты в ней не уверен — не изобретай её, "
         "а разреши ситуацию повествовательно, без выдуманных чисел и эффектов.",
     ]
+
+
+def build_reference_digest(
+    *,
+    full: bool = True,
+    species_name: Optional[str] = None,
+) -> str:
+    """Формирует компактную выжимку официальных правил D&D 2024 для промпта Мастера.
+
+    :param full: True — полная выжимка (по умолчанию): все разделы, включая «Создание
+        персонажа» и расовые особенности всех видов. False — игровой этап: без блока
+        создания персонажа и только с особенностями текущего героя (species_name).
+    :param species_name: название вида героя; используется только при full=False.
+    """
+    lines: list[str] = []
+    lines += _digest_classes_lines()
+    lines += _digest_species(full=full, species_name=species_name)
+    if full:
+        lines += _digest_creation_lines()
+    lines += _digest_leveling_lines()
+    lines += _digest_weapons_lines()
+    lines += _digest_weapon_mastery_lines()
+    lines += _digest_armor_lines()
+    lines += _digest_skills_lines()
+    lines += _digest_conditions_lines()
+    lines += _digest_difficulty_lines()
+    lines += _digest_misc_lines()
+    lines += spellcasting_digest_lines()
+    lines += _digest_limits_lines()
     return "\n".join(lines)
 
