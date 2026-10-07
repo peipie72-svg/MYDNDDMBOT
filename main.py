@@ -19,6 +19,9 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
     /check     — меню проверок характеристик (СИЛ/ЛОВ/ТЕЛ/ИНТ/МУД/ХАР)
     /spells    — книга заклинаний: ячейки, применение и подготовка заклинаний
     /rest      — отдых: короткий (1 час) и продолжительный (8 часов), восстановление ячеек
+    /debug_tokens — СКРЫТАЯ команда (её нет в меню Telegram): расход токенов DeepSeek
+                    за текущую сессию и размер последнего запроса. Только администраторы
+                    из ADMIN_USER_IDS (см. handle_debug_tokens)
 
 ЭТАП 0 — выбор сеттинга (мира игры):
     Прежде чем описывать героя, игрок выбирает мир кнопками «🎲 Забытые Королевства (D&D)»
@@ -318,6 +321,15 @@ def _parse_id_set(value: str) -> frozenset[int]:
 # Белый список игроков (пусто — пускаем всех) и администраторы (обходят лимиты).
 ALLOWED_USER_IDS = _parse_id_set(os.getenv("ALLOWED_USER_IDS", ""))
 ADMIN_USER_IDS = _parse_id_set(os.getenv("ADMIN_USER_IDS", ""))
+
+
+def _is_admin(user_id: int) -> bool:
+    """True, если пользователь — администратор.
+
+    Пустой ADMIN_USER_IDS трактуется как «все администраторы» (удобно в разработке);
+    в продакшене список задаётся в .env, и тогда доступ к скрытым командам есть только у него.
+    """
+    return not ADMIN_USER_IDS or user_id in ADMIN_USER_IDS
 
 # Ограничение частоты обращений на пользователя (скользящее окно).
 RATE_LIMIT_MAX_REQUESTS = _env_int("RATE_LIMIT_MAX_REQUESTS", 20)
@@ -3112,7 +3124,18 @@ class Session:
     поднимается из базы (см. Session.restore).
     """
 
-    __slots__ = ("user_id", "history", "character", "pending_action", "pending_suicide")
+    __slots__ = (
+        "user_id",
+        "history",
+        "character",
+        "pending_action",
+        "pending_suicide",
+        "session_tokens",
+        "last_prompt_tokens",
+        "last_completion_tokens",
+        "last_total_tokens",
+        "last_cache_hit_tokens",
+    )
 
     def __init__(self, user_id: int) -> None:
         self.user_id: int = int(user_id)
@@ -3124,6 +3147,13 @@ class Session:
         # Игрок заявил о желании убить героя: ждём явного «да»/«нет» на дисклеймере.
         # Поле только в памяти: при перезапуске бота ожидание подтверждения сбрасывается.
         self.pending_suicide: bool = False
+        # Расход токенов DeepSeek: сумма за текущую игру и замеры последнего запроса.
+        # Обновляются в ask_dungeon_master и _record_session_tokens; сбрасываются в clear().
+        self.session_tokens: int = 0
+        self.last_prompt_tokens: int = 0
+        self.last_completion_tokens: int = 0
+        self.last_total_tokens: int = 0
+        self.last_cache_hit_tokens: int = 0
 
     @classmethod
     def restore(cls, user_id: int) -> "Session":
@@ -3150,6 +3180,12 @@ class Session:
         self.character = Character()
         self.pending_action = None
         self.pending_suicide = False
+        # Новая игра — обнуляем и счётчики расхода токенов (см. /debug_tokens).
+        self.session_tokens = 0
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.last_cache_hit_tokens = 0
         db.clear_user(self.user_id)
         db.save_character(self.user_id, self.character)
 
@@ -3179,6 +3215,37 @@ def get_session(user_id: int) -> Session:
             session.character.level,
         )
     return session
+
+
+# Последний замер расхода токенов LLM: заполняется в ask_dungeon_master сразу после
+# ответа DeepSeek. Вызывающий код читает его синхронно после await (без точек переключения
+# задач), поэтому гонок между апдейтами нет. _record_session_tokens «потребляет» запись
+# и обнуляет её, чтобы токены одного запроса не посчитались дважды.
+_last_usage: Optional[dict[str, int]] = None
+
+
+def _record_session_tokens(session: Session) -> None:
+    """Добавляет расход последнего запроса LLM в счётчики сессии.
+
+    Вызывается сразу после ask_dungeon_master. Если данных нет (например, все попытки
+    запроса провалились), счётчики не трогаются.
+    """
+    global _last_usage
+    usage = _last_usage
+    _last_usage = None
+    if usage is None:
+        return
+    session.last_prompt_tokens = usage["prompt_tokens"]
+    session.last_completion_tokens = usage["completion_tokens"]
+    session.last_total_tokens = usage["total_tokens"]
+    session.last_cache_hit_tokens = usage["cache_hit_tokens"]
+    session.session_tokens += usage["total_tokens"]
+    logger.info(
+        "Пользователь %s: за запрос %d токенов (за сессию всего %d)",
+        session.user_id,
+        usage["total_tokens"],
+        session.session_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3287,6 +3354,26 @@ async def ask_dungeon_master(
     ]
 
     response = await _create_chat_completion(messages)
+
+    # Расход токенов DeepSeek: логируем стоимость и размер контекста каждого запроса,
+    # а сам замер передаём вызывающему коду для накопления статистики (см. _record_session_tokens).
+    global _last_usage
+    usage = getattr(response, "usage", None)
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+    # prompt_cache_hit_tokens — специфичное для DeepSeek поле: токены промпта из кэша (дешевле).
+    cache_hit = int(getattr(usage, "prompt_cache_hit_tokens", 0) or 0)
+    _last_usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cache_hit_tokens": cache_hit,
+    }
+    logger.info(
+        f"📊 [TOKENS] Вход: {prompt_tokens} (кэш: {cache_hit}), "
+        f"Выход: {completion_tokens} | ИТОГО: {total_tokens}"
+    )
 
     content = response.choices[0].message.content
     if not content or not content.strip():
@@ -3450,6 +3537,9 @@ async def _answer_with_dungeon_master(
         logger.exception("Непредвиденная ошибка при обращении к Мастеру")
         await message.answer(GENERIC_ERROR_TEXT)
         return
+
+    # Учитываем расход токенов DeepSeek за этот ход в счётчиках текущей сессии (/debug_tokens).
+    _record_session_tokens(session)
 
     # 1) Отделяем служебный блок изменений от текста и применяем его к листу персонажа.
     reply, control = extract_control_block(raw_reply)
@@ -3813,6 +3903,40 @@ async def handle_rest(message: Message) -> None:
         reply_markup=build_rest_keyboard(session.character),
     )
     logger.info("Пользователь %s открыл меню отдыха", message.from_user.id)
+
+
+@router.message(Command("debug_tokens"))
+async def handle_debug_tokens(message: Message) -> None:
+    """/debug_tokens — СКРЫТАЯ команда (нет в BOT_COMMANDS): сводка расхода токенов DeepSeek.
+
+    Доступна только администраторам из ADMIN_USER_IDS (пустой список — доступ всем, режим
+    разработки). Обычному игроку бот не отвечает, поэтому о существовании команды он не узнает.
+    """
+    if message.from_user is None:
+        return
+    if not _is_admin(message.from_user.id):
+        # Обычный игрок: команда как будто не существует — молчим, ничего не отправляем.
+        return
+    session = get_session(message.from_user.id)
+    if session.last_total_tokens:
+        last_request = (
+            f"Последний запрос: {session.last_total_tokens} токенов "
+            f"(вход {session.last_prompt_tokens}, кэш {session.last_cache_hit_tokens}, "
+            f"выход {session.last_completion_tokens})"
+        )
+    else:
+        last_request = "Последний запрос: обращений к Мастеру ещё не было."
+    await message.answer(
+        "📊 Расход токенов DeepSeek\n"
+        f"За текущую сессию: {session.session_tokens} токенов\n"
+        f"{last_request}"
+    )
+    logger.info(
+        "Пользователь %s запросил статистику токенов: за сессию %d, последний запрос %d",
+        message.from_user.id,
+        session.session_tokens,
+        session.last_total_tokens,
+    )
 
 
 @router.callback_query(F.data == "settings")
