@@ -221,7 +221,14 @@ LLM_REQUEST_TIMEOUT = 60.0       # таймаут одного запроса к
 LLM_MAX_ATTEMPTS = 4             # всего попыток: 1 запрос + 3 повтора
 LLM_RETRY_BASE_DELAY = 2.0       # базовая пауза между попытками, сек (удваивается)
 
-MAX_HISTORY_MESSAGES = 20        # сколько последних сообщений держим в памяти и грузим из БД
+# Мирное окно истории: сколько последних сообщений отправляем модели вне боя и грузим из БД.
+# Экономит контекст: для текущей сцены достаточно ~6 реплик «игрок/Мастер».
+MAX_HISTORY_MESSAGES = 12
+# Страховочный потолок боевой цепочки. ВО ВРЕМЯ БОЯ история не обрезается (полный контекст
+# раундов); лимит срабатывает лишь при экстремально затяжном бое, чтобы не переполнить контекст.
+COMBAT_HISTORY_SAFETY_LIMIT = 80
+# Метка краткого итога закончившегося боя в истории диалога (заменяет подробные раунды боя).
+BATTLE_SUMMARY_PREFIX = "[ИТОГ БИТВЫ]:"
 DM_MAX_TOKENS = 1200             # лимит длины ответа Мастера
 DM_TEMPERATURE = 0.65            # ниже 1.0 — меньше галлюцинаций и «псевдославянской» архаики в тексте
 TELEGRAM_MESSAGE_LIMIT = 4000    # с запасом к лимиту Telegram в 4096 символов
@@ -2460,7 +2467,7 @@ CONTROL_BLOCK_KEYS = frozenset(
         "xp_gained", "hp_change", "add_items", "remove_items", "gp_change",
         "name", "race", "class_name", "level", "abilities", "description",
         "max_hp", "current_hp", "heroic_inspiration",
-        "location", "quest",
+        "location", "quest", "in_combat", "battle_summary",
     }
 )
 
@@ -2489,6 +2496,14 @@ CONTROL_KEY_ALIASES: dict[str, str] = {
     "species": "race",
     "локация": "location",
     "цель": "quest",
+    "combat": "in_combat",
+    "in_battle": "in_combat",
+    "combat_active": "in_combat",
+    "бой": "in_combat",
+    "battle": "in_combat",
+    "battle_result": "battle_summary",
+    "battle_log": "battle_summary",
+    "итог_битвы": "battle_summary",
 }
 
 
@@ -2541,6 +2556,10 @@ class ControlBlock(BaseModel):
     add_items: Optional[list[str]] = None
     remove_items: Optional[list[str]] = None
     gp_change: Optional[int] = None
+
+    # Боевой режим (память о бое): идёт ли бой и его краткий итог при завершении.
+    in_combat: Optional[bool] = None
+    battle_summary: Optional[str] = None
 
 
 def validate_control_block(data: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -3068,15 +3087,20 @@ class BotDatabase:
 
     # --- таблица chat_history ---
 
-    def append_message(self, user_id: int, role: str, content: str) -> None:
-        """Добавляет одно сообщение (user/assistant) в историю игрока."""
+    def append_message(self, user_id: int, role: str, content: str) -> int:
+        """Добавляет одно сообщение (user/assistant) в историю игрока.
+
+        Возвращает id вставленной строки: он нужен, чтобы при свёртке боя удалить именно
+        боевые сообщения и заменить их кратким резюме (см. Session.end_combat).
+        """
         with self._lock:
             conn = self._connect()
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)",
                 (int(user_id), str(role), str(content)),
             )
             conn.commit()
+            return int(cursor.lastrowid or 0)
 
     def load_history(
         self,
@@ -3091,6 +3115,30 @@ class BotDatabase:
                 (int(user_id), max(0, int(limit))),
             ).fetchall()
         return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+
+    def last_message_id(self, user_id: int) -> Optional[int]:
+        """id последнего сообщения игрока в chat_history (None, если истории нет)."""
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT id FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                (int(user_id),),
+            ).fetchone()
+        return int(row["id"]) if row is not None else None
+
+    def delete_messages_after(self, user_id: int, first_id: int) -> int:
+        """Удаляет сообщения игрока с id >= first_id (свёртка боевой истории).
+
+        Нужна, чтобы заменить подробные раунды боя одной строкой-резюме и не хранить
+        технические логи ударов. Возвращает число удалённых строк.
+        """
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                cursor = conn.execute(
+                    "DELETE FROM chat_history WHERE user_id = ? AND id >= ?",
+                    (int(user_id), int(first_id)),
+                )
+        return int(cursor.rowcount or 0)
 
     def clear_user(self, user_id: int) -> None:
         """Удаляет историю и лист персонажа игрока (команды /start и /reset)."""
@@ -3118,10 +3166,12 @@ class Session:
     """
     Сессия одного пользователя: история диалога и лист персонажа.
 
-    В памяти лежат только последние MAX_HISTORY_MESSAGES сообщений,
-    чтобы не переполнять контекст модели и не жечь токены. Каждое изменение
-    сразу дублируется в SQLite, поэтому при перезапуске бота прогресс игрока
-    поднимается из базы (см. Session.restore).
+    В памяти хранится вся история, но в модель вне боя уходит лишь скользящее окно
+    последних MAX_HISTORY_MESSAGES сообщений — чтобы не переполнять контекст и не жечь
+    токены. Во время боя окно НЕ обрезается, а после боя подробные раунды сворачиваются
+    в краткое резюме (см. begin_combat/end_combat). Каждое изменение сразу дублируется
+    в SQLite, поэтому при перезапуске бота прогресс игрока поднимается из базы
+    (см. Session.restore).
     """
 
     __slots__ = (
@@ -3130,6 +3180,10 @@ class Session:
         "character",
         "pending_action",
         "pending_suicide",
+        "in_combat",
+        "combat_start",
+        "combat_first_db_id",
+        "_last_db_id",
         "session_tokens",
         "last_prompt_tokens",
         "last_completion_tokens",
@@ -3139,7 +3193,9 @@ class Session:
 
     def __init__(self, user_id: int) -> None:
         self.user_id: int = int(user_id)
-        self.history: deque[dict[str, str]] = deque(maxlen=MAX_HISTORY_MESSAGES)
+        # Полная история сессии (без автообрезки). Обрезку мирного окна делает messages(),
+        # чтобы во время боя НЕ терять ни одного раунда (см. in_combat/combat_start).
+        self.history: list[dict[str, str]] = []
         self.character: Character = Character()
         # Что сделать сразу после выбора сеттинга (например, собрать случайного героя).
         # Поле только в памяти: при перезапуске бота просто теряется — игрок нажмёт кнопку снова.
@@ -3147,6 +3203,13 @@ class Session:
         # Игрок заявил о желании убить героя: ждём явного «да»/«нет» на дисклеймере.
         # Поле только в памяти: при перезапуске бота ожидание подтверждения сбрасывается.
         self.pending_suicide: bool = False
+        # Боевой режим: во время боя messages() отдаёт полную боевую цепочку, а после боя она
+        # сворачивается в одну строку-резюме (см. begin_combat/end_combat).
+        self.in_combat: bool = False
+        self.combat_start: Optional[int] = None
+        self.combat_first_db_id: Optional[int] = None
+        # id последнего добавленного в базу сообщения (нужен для свёртки боя).
+        self._last_db_id: Optional[int] = None
         # Расход токенов DeepSeek: сумма за текущую игру и замеры последнего запроса.
         # Обновляются в ask_dungeon_master и _record_session_tokens; сбрасываются в clear().
         self.session_tokens: int = 0
@@ -3167,12 +3230,13 @@ class Session:
             session.character = stored
         for message in db.load_history(user_id):
             session.history.append(message)
+        session._last_db_id = db.last_message_id(user_id)
         return session
 
     def add(self, role: str, content: str) -> None:
         """Добавляет сообщение роли 'user' или 'assistant' в историю (память + база)."""
         self.history.append({"role": role, "content": content})
-        db.append_message(self.user_id, role, content)
+        self._last_db_id = db.append_message(self.user_id, role, content)
 
     def clear(self) -> None:
         """Полностью очищает историю и создаёт нового персонажа (память + база)."""
@@ -3180,6 +3244,10 @@ class Session:
         self.character = Character()
         self.pending_action = None
         self.pending_suicide = False
+        self.in_combat = False
+        self.combat_start = None
+        self.combat_first_db_id = None
+        self._last_db_id = None
         # Новая игра — обнуляем и счётчики расхода токенов (см. /debug_tokens).
         self.session_tokens = 0
         self.last_prompt_tokens = 0
@@ -3194,8 +3262,54 @@ class Session:
         db.save_character(self.user_id, self.character)
 
     def messages(self) -> list[dict[str, str]]:
-        """Снимок истории для передачи в API (без системного промпта)."""
+        """Снимок истории для передачи в API (без системного промпта).
+
+        Вне боя отдаём скользящее окно последних MAX_HISTORY_MESSAGES сообщений (экономия
+        контекста). В бою окно НЕ обрезается: к последним мирным сообщениям добавляется вся
+        боевая цепочка целиком, чтобы Мастер помнил все раунды, ранения и позиции врагов.
+        """
+        if self.in_combat:
+            start = self.combat_start if self.combat_start is not None else len(self.history)
+            start = max(0, min(start, len(self.history)))
+            head = self.history[:start]
+            if len(head) > MAX_HISTORY_MESSAGES:
+                head = head[-MAX_HISTORY_MESSAGES:]
+            battle = self.history[start:]
+            # Страховка от переполнения очень затяжного боя (обычный бой укладывается целиком).
+            if len(battle) > COMBAT_HISTORY_SAFETY_LIMIT:
+                battle = battle[-COMBAT_HISTORY_SAFETY_LIMIT:]
+            return [*head, *battle]
+        if len(self.history) > MAX_HISTORY_MESSAGES:
+            return list(self.history[-MAX_HISTORY_MESSAGES:])
         return list(self.history)
+
+    def begin_combat(self) -> None:
+        """Помечает начало боя: с этого момента messages() не обрезает историю."""
+        self.in_combat = True
+        self.combat_start = len(self.history) - 1 if self.history else 0
+        self.combat_first_db_id = self._last_db_id
+
+    def end_combat(self, summary: str) -> None:
+        """Завершает бой: сворачивает подробную боевую цепочку в одну строку-резюме.
+
+        Подробные боевые сообщения (раунды, броски, урон) удаляются из оперативной истории
+        диалога и из хвоста таблицы chat_history, а вместо них остаётся краткий итог.
+        """
+        start = self.combat_start if self.combat_start is not None else len(self.history)
+        start = max(0, min(start, len(self.history)))
+        note = {
+            "role": "user",
+            "content": f"[СИСТЕМА] {BATTLE_SUMMARY_PREFIX} {summary.strip() or 'сражение завершено.'}",
+        }
+        self.history = self.history[:start] + [note]
+        self.in_combat = False
+        self.combat_start = None
+        # Переписываем хвост базы: удаляем подробные боевые строки и записываем резюме.
+        # (id сообщений начинаются с 1, поэтому 0/None безопасно трактуем как «не удалять».)
+        if self.combat_first_db_id:
+            db.delete_messages_after(self.user_id, self.combat_first_db_id)
+        self._last_db_id = db.append_message(self.user_id, note["role"], note["content"])
+        self.combat_first_db_id = None
 
 
 # user_id -> Session
@@ -3508,6 +3622,83 @@ def _character_change_status(character: Character, xp_delta: int, hp_delta: int)
     return " | ".join(parts)
 
 
+# --- Боевой режим: полный контекст боя и свёртка боя в краткое резюме ---
+
+# Напоминание Мастеру во время боя (не хранится в истории): держать полный учёт и вовремя
+# сообщить о конце боя, чтобы код сжал подробные раунды в одну строку-резюме.
+COMBAT_CONTINUATION_NOTE = (
+    "[СИСТЕМА] Продолжается бой. Веди полный учёт всех врагов, их ранений и позиций, "
+    "заканчивай ход фразой «Твой ход» и указывай в служебном блоке \"in_combat\": true. "
+    "Если бой в этом ходе ЗАВЕРШИЛСЯ — поставь \"in_combat\": false и добавь "
+    "\"battle_summary\" с кратким итогом схватки."
+)
+
+
+def _control_flag_to_bool(value: Any) -> Optional[bool]:
+    """Приводит значение флага из служебного блока к bool/None (терпимо к строкам)."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"true", "1", "yes", "да", "y", "on", "бой", "бою"}:
+            return True
+        if token in {"false", "0", "no", "нет", "n", "off", "мир"}:
+            return False
+    return None
+
+
+def _fallback_battle_summary(session: "Session") -> str:
+    """Запасной итог боя, если Мастер не прислал поле \"battle_summary\"."""
+    location = (session.character.location or "").strip()
+    return f"сражение завершено (локация: {location})" if location else "сражение завершено."
+
+
+def _update_combat_state(
+    session: "Session",
+    control: Optional[dict],
+    reply: str,
+    was_in_combat: bool,
+) -> None:
+    """Обновляет боевой режим сессии: начало боя и свёртку боя после его окончания.
+
+    Во время боя история не обрезается (см. Session.messages), а когда бой завершён —
+    подробные раунды заменяются одной строкой-резюме, чтобы освободить контекст.
+    """
+    if not session.character.hero_confirmed:
+        return  # до начала игры боя быть не может
+
+    signal = _control_flag_to_bool(control.get("in_combat")) if control else None
+
+    if signal is None:
+        # Мастер не прислал флаг: ориентируемся на каноническую фразу конца боевого хода.
+        ends_in_combat = "твой ход" in reply.lower()
+        if was_in_combat and not ends_in_combat:
+            session.end_combat(_fallback_battle_summary(session))
+            logger.info("Пользователь %s: бой завершён (без флага) — история свёрнута", session.user_id)
+        elif not was_in_combat and ends_in_combat:
+            session.begin_combat()
+            logger.info("Пользователь %s: начался бой — история не будет обрезаться", session.user_id)
+        return
+
+    if signal and not was_in_combat:
+        session.begin_combat()
+        logger.info("Пользователь %s: начался бой — история не будет обрезаться", session.user_id)
+    elif not signal and was_in_combat:
+        summary = ""
+        if control:
+            raw = control.get("battle_summary")
+            if isinstance(raw, str) and raw.strip():
+                summary = " ".join(raw.split())
+        if len(summary) > 400:
+            summary = summary[:400].rstrip() + "…"
+        session.end_combat(summary or _fallback_battle_summary(session))
+        logger.info("Пользователь %s: бой завершён — раунды сжаты в резюме", session.user_id)
+
+
 async def _answer_with_dungeon_master(
     message: Message,
     session: Session,
@@ -3522,9 +3713,16 @@ async def _answer_with_dungeon_master(
     """
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
+    # Запоминаем боевой режим ДО обращения к модели: именно он решает, обрезать ли окно.
+    was_in_combat = session.in_combat
+    request_messages = session.messages()
+    if was_in_combat:
+        # Бой: подсказываем Мастеру держать полный учёт и вовремя закрыть бой (в память не идёт).
+        request_messages = [*request_messages, {"role": "user", "content": COMBAT_CONTINUATION_NOTE}]
+
     try:
         raw_reply = await ask_dungeon_master(
-            session.messages(),
+            request_messages,
             setting=session.character.setting,
             species_name=session.character.race,
             hero_ready=session.character.is_created,
@@ -3590,6 +3788,11 @@ async def _answer_with_dungeon_master(
     if not reply:
         # Модель вернула только служебный блок — не оставляем игрока без реплики.
         reply = "Мастер молчаливо следит за происходящим.\n\nЧто ты делаешь?"
+
+    # 2а) Боевой режим: во время боя история не обрезается, а после боя раунды сворачиваются
+    #     в одну строку-резюме. Делаем это ДО добавления ответа: бой считается начатым с
+    #     сообщения-триггера, а реплика-эпилог боя добавляется уже после свёртки.
+    _update_combat_state(session, control, reply, was_in_combat)
 
     # 2) В память диалога кладём ТОЛЬКО чистый текст (без служебного JSON и сводки HUD).
     session.add("assistant", reply)
